@@ -1,0 +1,37 @@
+{
+  "name": "osrs-ai-agent",
+  "version": "1.0.0",
+  "description": "AI Agent framework for managing OSRS automation on rs-sdk",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/cli.ts",
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "agent": "tsx src/cli.ts agent",
+    "monitor": "tsx src/cli.ts monitor",
+    "list": "tsx src/cli.ts list"
+  },
+  "keywords": [
+    "osrs",
+    "automation",
+    "ai-agent",
+    "rs-sdk"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "commander": "^11.0.0",
+    "dotenv": "^16.3.1",
+    "pino": "^8.16.1",
+    "pino-pretty": "^10.2.0",
+    "typescript": "^5.2.2",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.5.0",
+    "@types/ws": "^8.5.5",
+    "tsx": "^3.13.0"
+  }
+}
