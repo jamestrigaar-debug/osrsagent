@@ -196,7 +196,7 @@ npx tsc --noEmit
 
 Watch your bot play in real-time:
 
-https://rs-sdk-demo.fly.dev/bot?bot=trigaarbot8&password=iMAThClkHhE8
+https://rs-sdk-demo.fly.dev/bot?bot=trigaarbot8&password=*******
 
 ## Troubleshooting
 
