@@ -2,6 +2,7 @@ import "../scripts/index.js";
 
 import {
   RsSdkAdapter,
+  RsSdkAdapterOptions,
 } from "../adapters/rs-sdk.js";
 
 import {
@@ -99,31 +100,68 @@ export async function runGatheringCore(
   ctx: ScriptContext,
 ): Promise<GatheringCycleResult> {
   /*
-   * Reuse a shared adapter supplied by the caller.
-   * Otherwise create one here.
+   * Resolve adapter in priority order:
+   *
+   *   1. A shared adapter already attached to `ctx.adapter` (supplied by the
+   *      caller or a parent script — highest priority).
+   *   2. The shared adapter pool from `ctx.adapterPool` (one long-lived
+   *      WebSocket per account).
+   *   3. A fresh adapter created here (legacy fallback).
    */
   const suppliedAdapter =
     ctx.adapter as any;
 
-  const adapter =
-    suppliedAdapter &&
-    typeof suppliedAdapter.connect ===
-      "function" &&
-    typeof suppliedAdapter.disconnect ===
-      "function" &&
-    typeof suppliedAdapter.getState ===
-      "function"
-      ? suppliedAdapter as RsSdkAdapter
-      : new RsSdkAdapter({
-          server:
-            ctx.sdkBaseUrl,
+  const isValidAdapter =
+    (obj: unknown): obj is RsSdkAdapter =>
+      Boolean(
+        obj &&
+        typeof (obj as any).connect === 'function' &&
+        typeof (obj as any).disconnect === 'function' &&
+        typeof (obj as any).getState === 'function',
+      );
 
-          botName:
-            ctx.sdkBotName,
+  let adapter:
+    RsSdkAdapter;
 
-          password:
-            ctx.sdkBotPassword,
-        });
+  let usedPool =
+    false;
+
+  const adapterOptions:
+    RsSdkAdapterOptions = {
+    server:
+      ctx.sdkBaseUrl,
+
+    botName:
+      ctx.sdkBotName,
+
+    password:
+      ctx.sdkBotPassword,
+  };
+
+  if (
+    isValidAdapter(
+      suppliedAdapter,
+    )
+  ) {
+    adapter =
+      suppliedAdapter;
+  } else if (
+    ctx.adapterPool
+  ) {
+    adapter =
+      await ctx.adapterPool.getAdapter(
+        ctx.accountId,
+        adapterOptions,
+      );
+
+    usedPool =
+      true;
+  } else {
+    adapter =
+      new RsSdkAdapter(
+        adapterOptions,
+      );
+  }
 
   /*
    * All child scripts receive the same live adapter.
@@ -1069,13 +1107,24 @@ export async function runGatheringCore(
     );
   } finally {
     /*
-     * Only disconnect an adapter created by this core.
+     * Lifecycle rules:
      *
-     * A shared adapter belongs to the caller.
+     *   - Pooled adapter: call release() — the pool keeps it alive.
+     *   - Supplied adapter: owned by the caller — do not disconnect.
+     *   - Fresh adapter created by this core: disconnect and clean up.
      */
     if (
-      !suppliedAdapter ||
-      suppliedAdapter !== adapter
+      usedPool &&
+      ctx.adapterPool
+    ) {
+      ctx.adapterPool.release(
+        ctx.accountId,
+      );
+    } else if (
+      !isValidAdapter(
+        suppliedAdapter,
+      ) &&
+      !usedPool
     ) {
       await adapter.disconnect();
     }

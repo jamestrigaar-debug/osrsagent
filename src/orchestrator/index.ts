@@ -19,6 +19,18 @@ import {
 } from '../dashboard/server.js';
 
 import {
+  AdapterPool,
+} from '../adapters/adapter-pool.js';
+
+import {
+  CommandQueue,
+} from '../queue/command-queue.js';
+
+import {
+  config,
+} from '../config/index.js';
+
+import {
   logger,
 } from '../logger.js';
 
@@ -52,6 +64,12 @@ export class Orchestrator {
   private dispatcher:
     Dispatcher;
 
+  private adapterPool:
+    AdapterPool;
+
+  private commandQueue:
+    CommandQueue;
+
   private running =
     false;
 
@@ -81,9 +99,17 @@ export class Orchestrator {
         [],
     };
 
+    this.adapterPool =
+      new AdapterPool();
+
+    this.commandQueue =
+      new CommandQueue();
+
     this.dispatcher =
       new Dispatcher(
         new Planner(),
+        this.commandQueue,
+        this.adapterPool,
       );
   }
 
@@ -145,6 +171,34 @@ export class Orchestrator {
       this.ensureAccounts(
         botName,
       );
+
+    /*
+     * ------------------------------------------------------------
+     * ADAPTER POOL — pre-register connection options per account
+     * ------------------------------------------------------------
+     *
+     * The pool will connect lazily on first use, but having the options
+     * registered here means `getAdapter()` can be called without
+     * passing options every time.
+     */
+    for (
+      const accountId of
+        accountIds
+    ) {
+      this.adapterPool.registerOptions(
+        accountId,
+        {
+          server:
+            config.rs_sdk.baseUrl,
+
+          botName:
+            config.bot.name,
+
+          password:
+            config.bot.password,
+        },
+      );
+    }
 
     /*
      * ------------------------------------------------------------
@@ -256,6 +310,8 @@ export class Orchestrator {
       startDashboard(
         this.options
           .dashboardPort,
+        this.commandQueue,
+        this.adapterPool,
       );
     }
 
@@ -389,6 +445,12 @@ export class Orchestrator {
 
     this.tickInProgress =
       false;
+
+    /*
+     * Destroy the shared adapter pool — this closes all long-lived
+     * WebSocket connections gracefully.
+     */
+    void this.adapterPool.destroy();
 
     closeMemoryStore();
 

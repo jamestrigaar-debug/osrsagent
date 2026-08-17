@@ -15,6 +15,7 @@ import {
   AccountMemory,
   ActivePlan,
   ActionResult,
+  PlanStep,
 } from '../memory/types.js';
 
 import {
@@ -54,6 +55,18 @@ import {
 import {
   buildPhase1Plan,
 } from '../commands/phase1-executor.js';
+
+import type {
+  CommandQueue,
+} from '../queue/command-queue.js';
+
+import type {
+  Command,
+} from '../queue/types.js';
+
+import type {
+  AdapterPool,
+} from '../adapters/adapter-pool.js';
 
 export type DispatchResult =
   | {
@@ -103,12 +116,42 @@ export class Dispatcher {
   private planner:
     Planner;
 
+  /**
+   * Optional command queue.
+   *
+   * When set, the dispatcher will dequeue and execute commands before
+   * escalating to the LLM Planner when no active plan is present.
+   */
+  private commandQueue:
+    CommandQueue | null;
+
+  /**
+   * Optional shared adapter pool.
+   *
+   * When set, script contexts are hydrated with a long-lived pooled
+   * adapter so all scripts reuse the same WebSocket connection.
+   */
+  private adapterPool:
+    AdapterPool | null;
+
   constructor(
     planner:
       Planner,
+
+    commandQueue?:
+      CommandQueue | null,
+
+    adapterPool?:
+      AdapterPool | null,
   ) {
     this.planner =
       planner;
+
+    this.commandQueue =
+      commandQueue ?? null;
+
+    this.adapterPool =
+      adapterPool ?? null;
   }
 
   /* ================================================================
@@ -320,12 +363,108 @@ export class Dispatcher {
 
     /*
      * ------------------------------------------------------------
-     * NO PLAN -> PHASE 2 ONLY
+     * NO PLAN -> CHECK QUEUE BEFORE PHASE 2
      * ------------------------------------------------------------
+     *
+     * When there is no active plan, pull from the command queue
+     * before invoking the LLM Planner.  This keeps user-provided
+     * tasks fast and avoids unnecessary AI round-trips.
      */
     if (
       !memory.activePlan
     ) {
+      if (
+        this.commandQueue
+      ) {
+        const command =
+          this.commandQueue.dequeue();
+
+        if (
+          command
+        ) {
+          let step:
+            PlanStep;
+
+          try {
+            step =
+              commandToStep(
+                command,
+              );
+          } catch (
+            err
+          ) {
+            logger.warn(
+              {
+                accountId,
+
+                command,
+
+                err,
+              },
+              'Dispatcher: skipping malformed queued command',
+            );
+
+            return {
+              status:
+                'ok',
+
+              message:
+                'Skipped malformed queued command',
+            };
+          }
+
+          const queuedPlan:
+            ActivePlan = {
+            planId:
+              `queue-${command.id}`,
+
+            goal:
+              memory.currentGoal ||
+              `queue-${command.type}`,
+
+            steps: [step],
+
+            currentStepIndex:
+              0,
+
+            onMissingCapability:
+              'invoke_sdk_or_ask_user',
+
+            createdAt:
+              Date.now(),
+          };
+
+          storePlan(
+            accountId,
+            queuedPlan,
+          );
+
+          logger.info(
+            {
+              accountId,
+
+              commandId:
+                command.id,
+
+              commandType:
+                command.type,
+
+              script:
+                step.script,
+            },
+            'Dispatcher: queued command loaded as plan step',
+          );
+
+          return {
+            status:
+              'ok',
+
+            message:
+              `Queued command '${step.script}' loaded`,
+          };
+        }
+      }
+
       return this.escalateToPlanner(
         memory,
         'no_plan',
@@ -657,12 +796,6 @@ export class Dispatcher {
     const controller =
       new AbortController();
 
-    const context =
-      this.buildContext(
-        memory,
-        controller.signal,
-      );
-
     logger.info(
       {
         accountId,
@@ -683,6 +816,53 @@ export class Dispatcher {
 
     const promise =
       (async () => {
+        /*
+         * Pre-fetch the pooled adapter so all scripts in this step
+         * share the same long-lived WebSocket connection.
+         */
+        let pooledAdapter:
+          unknown;
+
+        if (
+          this.adapterPool
+        ) {
+          try {
+            pooledAdapter =
+              await this.adapterPool.getAdapter(
+                accountId,
+                {
+                  server:
+                    config.rs_sdk.baseUrl,
+
+                  botName:
+                    config.bot.name,
+
+                  password:
+                    config.bot.password,
+                },
+              );
+          } catch (
+            poolErr
+          ) {
+            logger.warn(
+              {
+                accountId,
+
+                err:
+                  poolErr,
+              },
+              'Dispatcher: adapter pool unavailable; falling back to fresh adapter',
+            );
+          }
+        }
+
+        const context =
+          this.buildContext(
+            memory,
+            controller.signal,
+            pooledAdapter,
+          );
+
         const result =
           await executeScript(
             step.script,
@@ -1150,6 +1330,9 @@ export class Dispatcher {
 
     cancelSignal?:
       AbortSignal,
+
+    adapter?:
+      unknown,
   ): ScriptContext {
     return {
       accountId:
@@ -1165,6 +1348,139 @@ export class Dispatcher {
         config.bot.password,
 
       cancelSignal,
+
+      adapter,
+
+      adapterPool:
+        this.adapterPool ??
+        undefined,
     } as ScriptContext;
+  }
+}
+
+/* ================================================================
+ * COMMAND → PLAN STEP CONVERSION
+ * ================================================================ */
+
+/**
+ * Convert a queued {@link Command} to a single {@link PlanStep} that
+ * the Dispatcher can execute using the standard plan machinery.
+ *
+ * Convention
+ * ----------
+ * - `travel`  — expects `params.x` and `params.z`; runs `walk_to`.
+ * - `gather`  — expects `params.profession` and `params.resource`; uses
+ *               `params.script` when supplied, else the profession name.
+ * - `generic` — requires `params.script`; all other params are forwarded
+ *               as-is.
+ *
+ * @throws {Error} when the command lacks the required fields.
+ */
+function commandToStep(
+  command:
+    Command,
+): PlanStep {
+  const { type, params } = command;
+
+  switch (type) {
+    case 'travel': {
+      const x =
+        params.x ??
+        params.destX ??
+        params.worldX;
+
+      const z =
+        params.z ??
+        params.destZ ??
+        params.worldZ;
+
+      if (
+        x === undefined ||
+        z === undefined
+      ) {
+        throw new Error(
+          `travel command requires 'x' and 'z' in params`,
+        );
+      }
+
+      const script =
+        typeof params.script === 'string' &&
+        params.script
+          ? params.script
+          : 'walk_to';
+
+      return {
+        script,
+
+        params: {
+          x,
+          z,
+          tolerance:
+            params.tolerance ?? 3,
+        },
+
+        description:
+          `Travel to (${x}, ${z})`,
+      };
+    }
+
+    case 'gather': {
+      const profession =
+        String(
+          params.profession ?? '',
+        );
+
+      const resource =
+        String(
+          params.resource ?? '',
+        );
+
+      const script =
+        typeof params.script === 'string' &&
+        params.script
+          ? params.script
+          : profession || 'gather';
+
+      return {
+        script,
+
+        params: {
+          ...params,
+          profession,
+          resource,
+        },
+
+        description:
+          `Gather ${resource} (${profession})`,
+      };
+    }
+
+    case 'generic':
+    default: {
+      const script =
+        typeof params.script === 'string'
+          ? params.script
+          : '';
+
+      if (!script) {
+        throw new Error(
+          `generic command requires 'script' field in params`,
+        );
+      }
+
+      /*
+       * Forward every field except 'script' as script params.
+       */
+      const { script: _ignored, ...rest } = params;
+
+      return {
+        script,
+
+        params: rest,
+
+        description:
+          `Run ${script}`,
+      };
+    }
   }
 }
