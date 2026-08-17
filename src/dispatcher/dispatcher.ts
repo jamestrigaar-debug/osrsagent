@@ -85,6 +85,17 @@ export class Dispatcher {
     Map<string, number> =
       new Map();
 
+  /**
+   * Tracks the earliest timestamp (ms since epoch) at which each account
+   * is allowed to start its next step after a failure.
+   *
+   * Backoff schedule: `min(500 * 2^consecutiveFailures, 30_000)` ms.
+   * Reset to 0 on every successful step.
+   */
+  private nextRetryAfter:
+    Map<string, number> =
+      new Map();
+
   private runningTasks:
     Map<string, RunningTask> =
       new Map();
@@ -439,6 +450,31 @@ export class Dispatcher {
      * START STEP
      * ------------------------------------------------------------
      */
+
+    /*
+     * Exponential backoff guard.
+     *
+     * If the previous step failed we may be in a back-off window.
+     * Skip this tick and let the timer run down rather than
+     * hammering the SDK on every 500 ms tick.
+     */
+    const nextRetry =
+      this.nextRetryAfter.get(
+        accountId,
+      ) ?? 0;
+
+    if (
+      Date.now() < nextRetry
+    ) {
+      return {
+        status:
+          'ok',
+
+        message:
+          `Backing off after failure — retrying in ${Math.ceil((nextRetry - Date.now()) / 1000)}s`,
+      };
+    }
+
     this.startStep(
       memory,
       plan,
@@ -719,6 +755,26 @@ export class Dispatcher {
             failures,
           );
 
+          /*
+           * Apply exponential back-off so a broken step doesn't
+           * hammer the SDK on every 500 ms tick.
+           *
+           * Schedule: min(500 * 2^failures, 30_000) ms.
+           */
+          const backoffMs =
+            Math.min(
+              500 * Math.pow(
+                2,
+                failures,
+              ),
+              30_000,
+            );
+
+          this.nextRetryAfter.set(
+            accountId,
+            Date.now() + backoffMs,
+          );
+
           logger.warn(
             {
               accountId,
@@ -732,6 +788,8 @@ export class Dispatcher {
                 step.script,
 
               failures,
+
+              backoffMs,
 
               message:
                 result.message,
@@ -782,6 +840,12 @@ export class Dispatcher {
               0,
             );
 
+            // A new plan is about to be created; clear any backoff
+            // so the first step of the fresh plan can start immediately.
+            this.nextRetryAfter.delete(
+              accountId,
+            );
+
             await this.escalateToPlanner(
               loadMemory(
                 accountId,
@@ -802,6 +866,12 @@ export class Dispatcher {
         this.consecutiveFailures.set(
           accountId,
           0,
+        );
+
+        // Reset backoff — this step succeeded so the next one may
+        // start without delay.
+        this.nextRetryAfter.delete(
+          accountId,
         );
 
         const latest =
@@ -972,6 +1042,12 @@ export class Dispatcher {
     running.controller.abort();
 
     this.runningTasks.delete(
+      accountId,
+    );
+
+    // A cancelled task means a new goal or stop command arrived.
+    // Clear any pending backoff so the fresh goal can start immediately.
+    this.nextRetryAfter.delete(
       accountId,
     );
   }
