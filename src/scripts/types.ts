@@ -2,6 +2,8 @@
  * Script manifest and registry types
  */
 
+import type { AdapterPool } from '../adapters/adapter-pool.js';
+
 export interface ParamSchema {
   [paramName: string]: string;
 }
@@ -56,6 +58,20 @@ export interface ScriptContext {
    * banking and gathering all reuse the same live controller.
    */
   adapter?: unknown;
+
+  /**
+   * Optional shared adapter pool.
+   *
+   * When supplied, scripts should obtain their adapter via
+   * `pool.getAdapter(accountId)` rather than creating a fresh one.
+   * The `createRsSdkAdapter` factory honours this automatically.
+   */
+  adapterPool?: AdapterPool;
+
+  /**
+   * Optional abort signal used to cancel a long-running script.
+   */
+  cancelSignal?: AbortSignal;
 }
 
 export interface ScriptResult {
