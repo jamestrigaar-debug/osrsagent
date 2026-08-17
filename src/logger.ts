@@ -1,7 +1,7 @@
 import pino from 'pino';
 import { config } from './config/index.js';
 
-const level = config.agent.logLevel || 'info';
+const level = config.orchestrator.logLevel || 'info';
 
 export const logger = pino(
   {

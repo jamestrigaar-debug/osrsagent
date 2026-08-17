@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OSRS Agent Dashboard</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; margin: 0; padding: 16px; }
+    h1 { color: #c8a96e; }
+    .card { background: #16213e; border: 1px solid #0f3460; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+    label { color: #a0a0c0; font-size: 0.85em; }
+    input, select { background: #0d1b2a; color: #e0e0e0; border: 1px solid #0f3460; padding: 6px; border-radius: 4px; width: 100%; box-sizing: border-box; margin-top: 4px; }
+    button { background: #c8a96e; color: #1a1a2e; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-top: 8px; }
+    button:hover { background: #e0c080; }
+    pre { overflow-x: auto; font-size: 0.8em; white-space: pre-wrap; word-break: break-all; }
+    #status { color: #6ec89e; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>🗡 OSRS Agent Dashboard</h1>
+
+  <div class="card">
+    <label>Account</label>
+    <select id="accountSelect" onchange="loadMemoryView()"></select>
+  </div>
+
+  <div class="card">
+    <label>Set Goal</label>
+    <input id="goalInput" type="text" placeholder="e.g. reach fishing level 20" />
+    <button onclick="setGoal()">Inject Goal</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <label>Live Memory State</label>
+    <pre id="memoryView">Loading...</pre>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
