@@ -50,6 +50,30 @@ let actionsModulePromise:
  * RUNTIME SDK LOADING
  * ================================================================ */
 
+/** SDK module load timeout in milliseconds. */
+const SDK_LOAD_TIMEOUT_MS = 30_000;
+
+/**
+ * Create a promise that rejects after `ms` milliseconds.
+ * Used to guard dynamic imports from hanging indefinitely.
+ */
+function loadTimeout(ms: number, label: string): Promise<never> {
+  return new Promise<never>((_, reject) =>
+    setTimeout(
+      () => reject(new Error(`${label} load timed out after ${ms / 1000}s`)),
+      ms,
+    ),
+  );
+}
+
+/**
+ * Load the rs-sdk BotSDK module.
+ *
+ * The promise is cached so subsequent calls are instant.
+ * On failure (including timeout) the cache is cleared so
+ * the next caller can attempt a fresh load rather than
+ * receiving the same permanent rejection.
+ */
 async function loadSdkModule(): Promise<SDKModule> {
   if (!sdkModulePromise) {
     const sdkPath = join(
@@ -60,14 +84,25 @@ async function loadSdkModule(): Promise<SDKModule> {
       'index.ts',
     );
 
-    sdkModulePromise = import(
-      pathToFileURL(sdkPath).href
-    ) as Promise<SDKModule>;
+    sdkModulePromise = Promise.race([
+      import(pathToFileURL(sdkPath).href) as Promise<SDKModule>,
+      loadTimeout(SDK_LOAD_TIMEOUT_MS, 'SDK module'),
+    ]).catch((err: unknown) => {
+      // Clear the cache so the next call can retry.
+      sdkModulePromise = null;
+      throw err;
+    });
   }
 
   return sdkModulePromise;
 }
 
+/**
+ * Load the rs-sdk BotActions module.
+ *
+ * Applies the same timeout-and-retry-on-failure strategy as
+ * {@link loadSdkModule}.
+ */
 async function loadActionsModule(): Promise<ActionsModule> {
   if (!actionsModulePromise) {
     const actionsPath = join(
@@ -78,9 +113,14 @@ async function loadActionsModule(): Promise<ActionsModule> {
       'actions.ts',
     );
 
-    actionsModulePromise = import(
-      pathToFileURL(actionsPath).href
-    ) as Promise<ActionsModule>;
+    actionsModulePromise = Promise.race([
+      import(pathToFileURL(actionsPath).href) as Promise<ActionsModule>,
+      loadTimeout(SDK_LOAD_TIMEOUT_MS, 'Actions module'),
+    ]).catch((err: unknown) => {
+      // Clear the cache so the next call can retry.
+      actionsModulePromise = null;
+      throw err;
+    });
   }
 
   return actionsModulePromise;
@@ -959,6 +999,22 @@ export class RsSdkAdapter {
  * FACTORY
  * ================================================================ */
 
+/**
+ * Return the shared {@link RsSdkAdapter} from `ctx.adapter` when one is
+ * already available, creating a fresh adapter only when none is provided.
+ *
+ * **Adapter reuse pattern**
+ *
+ * Callers such as `GatheringCore` create a single adapter for a whole
+ * gathering cycle and attach it to `ScriptContext.adapter`.  Every
+ * prepare / equipment script (e.g. `ensure_mining_tool`) calls this
+ * factory with that same `ctx`, so they automatically share the live
+ * WebSocket connection instead of opening a second one.
+ *
+ * Adapter identity is checked by duck typing rather than `instanceof`
+ * because the SDK is dynamically imported and the same class can be
+ * represented by different module instances in the same process.
+ */
 export function createRsSdkAdapter(
   ctx: ScriptContext,
 ): RsSdkAdapter {
