@@ -13,6 +13,8 @@ import type {
   ScriptResult,
 } from "../scripts/types.js";
 
+import { updateAccountMemoryFromAdapter } from "../state/game-state-sync.js";
+
 export interface GatheringLocation {
   name: string;
   x: number;
@@ -1028,6 +1030,9 @@ export async function runGatheringCore(
       console.log(
         `[Gathering] Cycle ${cycle} complete. Continuing...`,
       );
+
+      // Persist live adapter state to SQLite so the Planner sees fresh data.
+      await updateAccountMemoryFromAdapter(adapter, ctx.accountId);
 
       cycle++;
     }
