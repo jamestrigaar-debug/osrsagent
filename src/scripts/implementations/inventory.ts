@@ -11,7 +11,10 @@ registerScript(
     params: { item: 'string — item name' },
     preconditions: ['item_in_inventory'],
     postconditions: ['item_equipped'],
+    failureModes: [],
+    category: 'equipment',
     verified: true,
+    version: 1,
   },
   async (params: Record<string, unknown>, ctx: ScriptContext): Promise<ScriptResult> => {
     const item = params['item'] as string;
@@ -43,7 +46,10 @@ registerScript(
     },
     preconditions: ['has_coins', 'near_shop_or_ge'],
     postconditions: ['item_in_inventory'],
+    failureModes: [],
+    category: 'shopping',
     verified: true,
+    version: 1,
   },
   async (params: Record<string, unknown>, ctx: ScriptContext): Promise<ScriptResult> => {
     const item = params['item'] as string;
