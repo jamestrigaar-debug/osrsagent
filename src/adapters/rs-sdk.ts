@@ -50,30 +50,6 @@ let actionsModulePromise:
  * RUNTIME SDK LOADING
  * ================================================================ */
 
-/** SDK module load timeout in milliseconds. */
-const SDK_LOAD_TIMEOUT_MS = 30_000;
-
-/**
- * Create a promise that rejects after `ms` milliseconds.
- * Used to guard dynamic imports from hanging indefinitely.
- */
-function loadTimeout(ms: number, label: string): Promise<never> {
-  return new Promise<never>((_, reject) =>
-    setTimeout(
-      () => reject(new Error(`${label} load timed out after ${ms / 1000}s`)),
-      ms,
-    ),
-  );
-}
-
-/**
- * Load the rs-sdk BotSDK module.
- *
- * The promise is cached so subsequent calls are instant.
- * On failure (including timeout) the cache is cleared so
- * the next caller can attempt a fresh load rather than
- * receiving the same permanent rejection.
- */
 async function loadSdkModule(): Promise<SDKModule> {
   if (!sdkModulePromise) {
     const sdkPath = join(
@@ -84,25 +60,14 @@ async function loadSdkModule(): Promise<SDKModule> {
       'index.ts',
     );
 
-    sdkModulePromise = Promise.race([
-      import(pathToFileURL(sdkPath).href) as Promise<SDKModule>,
-      loadTimeout(SDK_LOAD_TIMEOUT_MS, 'SDK module'),
-    ]).catch((err: unknown) => {
-      // Clear the cache so the next call can retry.
-      sdkModulePromise = null;
-      throw err;
-    });
+    sdkModulePromise = import(
+      pathToFileURL(sdkPath).href
+    ) as Promise<SDKModule>;
   }
 
   return sdkModulePromise;
 }
 
-/**
- * Load the rs-sdk BotActions module.
- *
- * Applies the same timeout-and-retry-on-failure strategy as
- * {@link loadSdkModule}.
- */
 async function loadActionsModule(): Promise<ActionsModule> {
   if (!actionsModulePromise) {
     const actionsPath = join(
@@ -113,14 +78,9 @@ async function loadActionsModule(): Promise<ActionsModule> {
       'actions.ts',
     );
 
-    actionsModulePromise = Promise.race([
-      import(pathToFileURL(actionsPath).href) as Promise<ActionsModule>,
-      loadTimeout(SDK_LOAD_TIMEOUT_MS, 'Actions module'),
-    ]).catch((err: unknown) => {
-      // Clear the cache so the next call can retry.
-      actionsModulePromise = null;
-      throw err;
-    });
+    actionsModulePromise = import(
+      pathToFileURL(actionsPath).href
+    ) as Promise<ActionsModule>;
   }
 
   return actionsModulePromise;
@@ -993,135 +953,12 @@ export class RsSdkAdapter {
       );
     }
   }
-
-  /* ================================================================
-   * FIREMAKING
-   * ================================================================ */
-
-  async makeFire(): Promise<ScriptResult> {
-    try {
-      await this.ensureConnected();
-
-      // The bot already has a Tinderbox and at least one Log in inventory.
-      return toScriptResult(
-        await this.bot.burnLogs('Logs'),
-      );
-    } catch (error) {
-      return failure('makeFire failed', error);
-    }
-  }
-
-  /* ================================================================
-   * COOKING
-   * ================================================================ */
-
-  async cookOnFire(
-    rawFood: string,
-    amount: number,
-  ): Promise<ScriptResult> {
-    try {
-      await this.ensureConnected();
-
-      // Find a nearby fire object (created by makeFire).
-      let fire = this.sdk.findNearbyLoc(/fire/i);
-      if (!fire) {
-        // On‑demand scan if the fire hasn't been picked up by the passive state.
-        fire = await this.sdk.scanFindNearbyLoc(/fire/i, 10);
-      }
-
-      if (!fire) {
-        return {
-          success: false,
-          message: 'No fire object found nearby',
-          data: { reason: 'fire_not_found' },
-        };
-      }
-
-      let cookedCount = 0;
-      const maxAttempts = Math.min(amount, 30); // safety cap
-
-      for (let i = 0; i < maxAttempts; i++) {
-        const rawItem = this.sdk.findInventoryItem(
-          new RegExp(`^${escapeRegex(rawFood)}$`, 'i'),
-        );
-
-        if (!rawItem) {
-          // No more raw food to cook.
-          break;
-        }
-
-        const result = await this.bot.useItemOnLoc(rawItem, fire, {
-          timeout: 8000,
-        });
-
-        if (!result?.success) {
-          // If the attempt failed but raw food disappeared, assume it cooked.
-          const remainingRaw = this.sdk.countInventoryItems(
-            new RegExp(`^${escapeRegex(rawFood)}$`, 'i'),
-          );
-          if (remainingRaw <= 0) {
-            cookedCount = amount; // all raw consumed, assume cooked
-            break;
-          }
-          // Otherwise, return failure.
-          return toScriptResult(result);
-        }
-
-        // Wait for the cooking animation / inventory change.
-        await this.sdk.waitForTicks(2);
-
-        // Count how many cooked items we have now.
-        const currentCooked = this.sdk.countInventoryItems(
-          new RegExp(`^${escapeRegex(rawFood.replace(/^Raw /, ''))}$`, 'i'),
-        );
-
-        if (currentCooked > cookedCount) {
-          cookedCount = currentCooked;
-          if (cookedCount >= amount) {
-            break;
-          }
-        }
-      }
-
-      if (cookedCount <= 0) {
-        return {
-          success: false,
-          message: 'No cooked food detected after cooking attempts',
-          data: { reason: 'cooking_failed' },
-        };
-      }
-
-      return {
-        success: true,
-        message: `Cooked ${cookedCount} ${rawFood.replace(/^Raw /, '')}`,
-        data: { amountCooked: cookedCount },
-      };
-    } catch (error) {
-      return failure('cookOnFire failed', error);
-    }
-  }
 }
 
 /* ================================================================
  * FACTORY
  * ================================================================ */
 
-/**
- * Return the shared {@link RsSdkAdapter} from `ctx.adapter` when one is
- * already available, creating a fresh adapter only when none is provided.
- *
- * **Adapter reuse pattern**
- *
- * Callers such as `GatheringCore` create a single adapter for a whole
- * gathering cycle and attach it to `ScriptContext.adapter`.  Every
- * prepare / equipment script (e.g. `ensure_mining_tool`) calls this
- * factory with that same `ctx`, so they automatically share the live
- * WebSocket connection instead of opening a second one.
- *
- * Adapter identity is checked by duck typing rather than `instanceof`
- * because the SDK is dynamically imported and the same class can be
- * represented by different module instances in the same process.
- */
 export function createRsSdkAdapter(
   ctx: ScriptContext,
 ): RsSdkAdapter {
