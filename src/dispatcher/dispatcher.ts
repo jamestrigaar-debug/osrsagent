@@ -93,18 +93,47 @@ interface RunningTask {
   promise: Promise<void>;
 }
 
+interface ProvisionCommand {
+  type: 'provision_food';
+
+  foodName: string;
+
+  rawFoodName: string;
+
+  targetBankedFood: number;
+
+  fishingLocation: string;
+
+  bank: string;
+
+  cookingLocation: string;
+
+  maxFishingRuns: number;
+
+  fishPerRun: number;
+
+  fishingMethod: string;
+}
+
+interface CombatCommand {
+  type: 'combat';
+
+  target: string;
+}
+
+interface GearCommand {
+  type: 'bronze_gear' | 'bronze_weapon';
+}
+
+/* ================================================================
+ * DISPATCHER
+ * ================================================================ */
+
 export class Dispatcher {
   private consecutiveFailures:
     Map<string, number> =
       new Map();
 
-  /**
-   * Tracks the earliest timestamp (ms since epoch) at which each account
-   * is allowed to start its next step after a failure.
-   *
-   * Backoff schedule: `min(500 * 2^consecutiveFailures, 30_000)` ms.
-   * Reset to 0 on every successful step.
-   */
   private nextRetryAfter:
     Map<string, number> =
       new Map();
@@ -116,21 +145,9 @@ export class Dispatcher {
   private planner:
     Planner;
 
-  /**
-   * Optional command queue.
-   *
-   * When set, the dispatcher will dequeue and execute commands before
-   * escalating to the LLM Planner when no active plan is present.
-   */
   private commandQueue:
     CommandQueue | null;
 
-  /**
-   * Optional shared adapter pool.
-   *
-   * When set, script contexts are hydrated with a long-lived pooled
-   * adapter so all scripts reuse the same WebSocket connection.
-   */
   private adapterPool:
     AdapterPool | null;
 
@@ -155,6 +172,40 @@ export class Dispatcher {
   }
 
   /* ================================================================
+   * EXTERNAL USER-REQUEST INTERRUPT
+   * ================================================================ */
+
+  async interruptPendingRequest(
+    accountId:
+      string,
+  ): Promise<DispatchResult | null> {
+    const memory =
+      loadMemory(
+        accountId,
+      );
+
+    if (
+      !memory.userRequest
+    ) {
+      return null;
+    }
+
+    logger.info(
+      {
+        accountId,
+
+        request:
+          memory.userRequest,
+      },
+      'Dispatcher: immediate user-request interrupt detected',
+    );
+
+    return this.handleUserRequest(
+      memory,
+    );
+  }
+
+  /* ================================================================
    * MAIN TICK
    * ================================================================ */
 
@@ -168,9 +219,7 @@ export class Dispatcher {
       );
 
     /*
-     * ------------------------------------------------------------
-     * NEW USER REQUEST
-     * ------------------------------------------------------------
+     * HIGHEST PRIORITY: USER REQUEST / INTERRUPT
      */
     if (
       memory.userRequest
@@ -181,9 +230,7 @@ export class Dispatcher {
     }
 
     /*
-     * ------------------------------------------------------------
      * NO GOAL
-     * ------------------------------------------------------------
      */
     if (
       !memory.currentGoal
@@ -195,27 +242,30 @@ export class Dispatcher {
     }
 
     /*
-     * ------------------------------------------------------------
-     * RESOLVE DETERMINISTIC PHASE 1 COMMAND
-     * ------------------------------------------------------------
-     *
-     * This happens BEFORE the no-plan/Planner branch.
-     *
-     * Therefore:
-     *
-     *   gather:mine-al-kharid
-     *
-     * can never accidentally fall through to the AI Planner.
+     * COMMAND RESOLUTION
      */
     const phase1Command =
       resolvePhase1Command(
         memory.currentGoal,
       );
 
+    const provisionCommand =
+      resolveProvisionCommand(
+        memory.currentGoal,
+      );
+
+    const combatCommand =
+      resolveCombatCommand(
+        memory.currentGoal,
+      );
+
+    const gearCommand =
+      resolveGearCommand(
+        memory.currentGoal,
+      );
+
     /*
-     * ------------------------------------------------------------
      * ACTIVE RUNNING TASK
-     * ------------------------------------------------------------
      */
     const running =
       this.runningTasks.get(
@@ -225,9 +275,6 @@ export class Dispatcher {
     if (
       running
     ) {
-      /*
-       * If a new plan replaced the old plan, cancel the stale task.
-       */
       if (
         !memory.activePlan ||
         memory.activePlan.planId !==
@@ -273,16 +320,133 @@ export class Dispatcher {
     }
 
     /*
-     * ------------------------------------------------------------
-     * DETERMINISTIC PLAN MISSING
-     * ------------------------------------------------------------
-     *
-     * This is the key fix.
-     *
-     * If the current goal is a known Phase 1 command but its plan
-     * disappeared, rebuild it.
-     *
-     * DO NOT escalate to the Planner.
+     * DETERMINISTIC PROVISION PLAN MISSING
+     */
+    if (
+      provisionCommand &&
+      !memory.activePlan
+    ) {
+      const provisionPlan =
+        buildProvisionPlan(
+          provisionCommand,
+        );
+
+      storePlan(
+        accountId,
+        provisionPlan,
+      );
+
+      logger.info(
+        {
+          accountId,
+
+          planId:
+            provisionPlan.planId,
+
+          goal:
+            provisionPlan.goal,
+
+          steps:
+            provisionPlan.steps,
+        },
+        'Dispatcher: rebuilt missing food provisioning plan',
+      );
+
+      return {
+        status:
+          'ok',
+
+        message:
+          `Food provisioning plan created: ${provisionPlan.planId}`,
+      };
+    }
+
+    /*
+     * DETERMINISTIC COMBAT PLAN MISSING
+     */
+    if (
+      combatCommand &&
+      !memory.activePlan
+    ) {
+      const combatPlan =
+        buildCombatPlan(
+          combatCommand,
+        );
+
+      storePlan(
+        accountId,
+        combatPlan,
+      );
+
+      logger.info(
+        {
+          accountId,
+
+          planId:
+            combatPlan.planId,
+
+          goal:
+            combatPlan.goal,
+
+          steps:
+            combatPlan.steps,
+        },
+        'Dispatcher: rebuilt missing combat plan',
+      );
+
+      return {
+        status:
+          'ok',
+
+        message:
+          `Combat plan created: ${combatPlan.planId}`,
+      };
+    }
+
+    /*
+     * DETERMINISTIC GEAR PLAN MISSING
+     */
+    if (
+      gearCommand &&
+      !memory.activePlan
+    ) {
+      const gearPlan =
+        buildGearPlan(
+          gearCommand,
+        );
+
+      storePlan(
+        accountId,
+        gearPlan,
+      );
+
+      logger.info(
+        {
+          accountId,
+
+          planId:
+            gearPlan.planId,
+
+          goal:
+            gearPlan.goal,
+
+          steps:
+            gearPlan.steps,
+        },
+        'Dispatcher: rebuilt missing gear plan',
+      );
+
+      return {
+        status:
+          'ok',
+
+        message:
+          `Gear plan created: ${gearPlan.planId}`,
+      };
+    }
+
+    /*
+     * DETERMINISTIC PHASE 1 PLAN MISSING
      */
     if (
       phase1Command &&
@@ -335,9 +499,7 @@ export class Dispatcher {
     }
 
     /*
-     * ------------------------------------------------------------
-     * PHASE 1 STOP
-     * ------------------------------------------------------------
+     * STOP
      */
     if (
       phase1Command?.type ===
@@ -352,6 +514,17 @@ export class Dispatcher {
         accountId,
       );
 
+      updateMemory(
+        accountId,
+        {
+          currentGoal:
+            '',
+
+          userRequest:
+            undefined,
+        },
+      );
+
       return {
         status:
           'ok',
@@ -362,13 +535,7 @@ export class Dispatcher {
     }
 
     /*
-     * ------------------------------------------------------------
-     * NO PLAN -> CHECK QUEUE BEFORE PHASE 2
-     * ------------------------------------------------------------
-     *
-     * When there is no active plan, pull from the command queue
-     * before invoking the LLM Planner.  This keeps user-provided
-     * tasks fast and avoids unnecessary AI round-trips.
+     * NO PLAN
      */
     if (
       !memory.activePlan
@@ -422,7 +589,9 @@ export class Dispatcher {
               memory.currentGoal ||
               `queue-${command.type}`,
 
-            steps: [step],
+            steps: [
+              step,
+            ],
 
             currentStepIndex:
               0,
@@ -465,6 +634,81 @@ export class Dispatcher {
         }
       }
 
+      /*
+       * Deterministic Phase 2 provisioning
+       */
+      if (
+        provisionCommand
+      ) {
+        const provisionPlan =
+          buildProvisionPlan(
+            provisionCommand,
+          );
+
+        storePlan(
+          accountId,
+          provisionPlan,
+        );
+
+        return {
+          status:
+            'ok',
+
+          message:
+            `Food provisioning plan created: ${provisionPlan.planId}`,
+        };
+      }
+
+      /*
+       * Deterministic combat
+       */
+      if (
+        combatCommand
+      ) {
+        const combatPlan =
+          buildCombatPlan(
+            combatCommand,
+          );
+
+        storePlan(
+          accountId,
+          combatPlan,
+        );
+
+        return {
+          status:
+            'ok',
+
+          message:
+            `Combat plan created: ${combatPlan.planId}`,
+        };
+      }
+
+      /*
+       * Deterministic gear
+       */
+      if (
+        gearCommand
+      ) {
+        const gearPlan =
+          buildGearPlan(
+            gearCommand,
+          );
+
+        storePlan(
+          accountId,
+          gearPlan,
+        );
+
+        return {
+          status:
+            'ok',
+
+          message:
+            `Gear plan created: ${gearPlan.planId}`,
+        };
+      }
+
       return this.escalateToPlanner(
         memory,
         'no_plan',
@@ -476,9 +720,7 @@ export class Dispatcher {
       memory.activePlan;
 
     /*
-     * ------------------------------------------------------------
      * GOAL MET
-     * ------------------------------------------------------------
      */
     if (
       isGoalMet(
@@ -505,9 +747,7 @@ export class Dispatcher {
     }
 
     /*
-     * ------------------------------------------------------------
      * PLAN EXHAUSTED
-     * ------------------------------------------------------------
      */
     if (
       plan.currentStepIndex >=
@@ -542,8 +782,14 @@ export class Dispatcher {
         accountId,
       );
 
+      /*
+       * Deterministic plan types
+       */
       if (
-        phase1Command
+        provisionCommand ||
+        phase1Command ||
+        combatCommand ||
+        gearCommand
       ) {
         return {
           status:
@@ -585,17 +831,7 @@ export class Dispatcher {
     }
 
     /*
-     * ------------------------------------------------------------
-     * START STEP
-     * ------------------------------------------------------------
-     */
-
-    /*
-     * Exponential backoff guard.
-     *
-     * If the previous step failed we may be in a back-off window.
-     * Skip this tick and let the timer run down rather than
-     * hammering the SDK on every 500 ms tick.
+     * FAILURE BACKOFF
      */
     const nextRetry =
       this.nextRetryAfter.get(
@@ -603,17 +839,24 @@ export class Dispatcher {
       ) ?? 0;
 
     if (
-      Date.now() < nextRetry
+      Date.now() <
+      nextRetry
     ) {
       return {
         status:
           'ok',
 
         message:
-          `Backing off after failure — retrying in ${Math.ceil((nextRetry - Date.now()) / 1000)}s`,
+          `Backing off after failure — retrying in ${Math.ceil(
+            (nextRetry - Date.now()) /
+              1000,
+          )}s`,
       };
     }
 
+    /*
+     * START STEP
+     */
     this.startStep(
       memory,
       plan,
@@ -651,17 +894,19 @@ export class Dispatcher {
       'Dispatcher: handling user request',
     );
 
-    /*
-     * Cancel current long-running task.
-     */
     this.cancelRunningTask(
       memory.accountId,
       'new user request',
     );
 
-    /*
-     * Clear the one-shot request and make it the new goal.
-     */
+    this.consecutiveFailures.delete(
+      memory.accountId,
+    );
+
+    this.nextRetryAfter.delete(
+      memory.accountId,
+    );
+
     updateMemory(
       memory.accountId,
       {
@@ -673,44 +918,179 @@ export class Dispatcher {
       },
     );
 
-    /*
-     * Remove old plan immediately.
-     */
     clearPlan(
       memory.accountId,
     );
 
-    /*
-     * ------------------------------------------------------------
-     * PHASE 1
-     * ------------------------------------------------------------
-     */
     const phase1Command =
       resolvePhase1Command(
         request,
       );
 
     if (
-      phase1Command
+      phase1Command?.type ===
+      'stop'
     ) {
-      if (
-        phase1Command.type ===
-        'stop'
-      ) {
-        appendHistory(
-          memory.accountId,
-          'Phase 1 task stopped',
+      updateMemory(
+        memory.accountId,
+        {
+          currentGoal:
+            '',
+
+          userRequest:
+            undefined,
+        },
+      );
+
+      appendHistory(
+        memory.accountId,
+        'Phase 1 task stopped',
+      );
+
+      return {
+        status:
+          'ok',
+
+        message:
+          'Task stopped',
+      };
+    }
+
+    const provisionCommand =
+      resolveProvisionCommand(
+        request,
+      );
+
+    if (
+      provisionCommand
+    ) {
+      const provisionPlan =
+        buildProvisionPlan(
+          provisionCommand,
         );
 
-        return {
-          status:
-            'ok',
+      storePlan(
+        memory.accountId,
+        provisionPlan,
+      );
 
-          message:
-            'Task stopped',
-        };
-      }
+      logger.info(
+        {
+          accountId:
+            memory.accountId,
 
+          planId:
+            provisionPlan.planId,
+
+          goal:
+            provisionPlan.goal,
+
+          steps:
+            provisionPlan.steps,
+        },
+        'Dispatcher: food provisioning plan created',
+      );
+
+      return {
+        status:
+          'ok',
+
+        message:
+          `Food provisioning plan created: ${provisionPlan.planId}`,
+      };
+    }
+
+    const combatCommand =
+      resolveCombatCommand(
+        request,
+      );
+
+    if (
+      combatCommand
+    ) {
+      const combatPlan =
+        buildCombatPlan(
+          combatCommand,
+        );
+
+      storePlan(
+        memory.accountId,
+        combatPlan,
+      );
+
+      logger.info(
+        {
+          accountId:
+            memory.accountId,
+
+          planId:
+            combatPlan.planId,
+
+          goal:
+            combatPlan.goal,
+
+          steps:
+            combatPlan.steps,
+        },
+        'Dispatcher: combat plan created',
+      );
+
+      return {
+        status:
+          'ok',
+
+        message:
+          `Combat plan created: ${combatPlan.planId}`,
+      };
+    }
+
+    const gearCommand =
+      resolveGearCommand(
+        request,
+      );
+
+    if (
+      gearCommand
+    ) {
+      const gearPlan =
+        buildGearPlan(
+          gearCommand,
+        );
+
+      storePlan(
+        memory.accountId,
+        gearPlan,
+      );
+
+      logger.info(
+        {
+          accountId:
+            memory.accountId,
+
+          planId:
+            gearPlan.planId,
+
+          goal:
+            gearPlan.goal,
+
+          steps:
+            gearPlan.steps,
+        },
+        'Dispatcher: gear plan created',
+      );
+
+      return {
+        status:
+          'ok',
+
+        message:
+          `Gear plan created: ${gearPlan.planId}`,
+      };
+    }
+
+    if (
+      phase1Command
+    ) {
       const phase1Plan =
         buildPhase1Plan(
           phase1Command,
@@ -759,11 +1139,6 @@ export class Dispatcher {
       };
     }
 
-    /*
-     * ------------------------------------------------------------
-     * PHASE 2
-     * ------------------------------------------------------------
-     */
     return this.escalateToPlanner(
       loadMemory(
         memory.accountId,
@@ -816,10 +1191,6 @@ export class Dispatcher {
 
     const promise =
       (async () => {
-        /*
-         * Pre-fetch the pooled adapter so all scripts in this step
-         * share the same long-lived WebSocket connection.
-         */
         let pooledAdapter:
           unknown;
 
@@ -895,9 +1266,6 @@ export class Dispatcher {
             accountId,
           );
 
-        /*
-         * Ignore stale completions.
-         */
         if (
           !current ||
           current.planId !==
@@ -912,11 +1280,27 @@ export class Dispatcher {
           accountId,
         );
 
-        /*
-         * ----------------------------------------------------------
-         * STEP FAILED
-         * ----------------------------------------------------------
-         */
+        if (
+          controller.signal.aborted
+        ) {
+          logger.info(
+            {
+              accountId,
+
+              planId:
+                plan.planId,
+
+              stepIndex,
+
+              script:
+                step.script,
+            },
+            'Dispatcher: step cancelled',
+          );
+
+          return;
+        }
+
         if (
           !result.success
         ) {
@@ -935,24 +1319,20 @@ export class Dispatcher {
             failures,
           );
 
-          /*
-           * Apply exponential back-off so a broken step doesn't
-           * hammer the SDK on every 500 ms tick.
-           *
-           * Schedule: min(500 * 2^failures, 30_000) ms.
-           */
           const backoffMs =
             Math.min(
-              500 * Math.pow(
-                2,
-                failures,
-              ),
+              500 *
+                Math.pow(
+                  2,
+                  failures,
+                ),
               30_000,
             );
 
           this.nextRetryAfter.set(
             accountId,
-            Date.now() + backoffMs,
+            Date.now() +
+              backoffMs,
           );
 
           logger.warn(
@@ -980,34 +1360,52 @@ export class Dispatcher {
             'Dispatcher: plan step failed',
           );
 
+          const latestMemory =
+            loadMemory(
+              accountId,
+            );
+
+          const latestPhase1 =
+            resolvePhase1Command(
+              latestMemory.currentGoal ??
+                '',
+            );
+
+          const latestProvision =
+            resolveProvisionCommand(
+              latestMemory.currentGoal ??
+                '',
+            );
+
+          const latestCombat =
+            resolveCombatCommand(
+              latestMemory.currentGoal ??
+                '',
+            );
+
+          const latestGear =
+            resolveGearCommand(
+              latestMemory.currentGoal ??
+                '',
+            );
+
           /*
-           * IMPORTANT:
-           *
-           * Phase 1 failures stay inside Phase 1.
-           * They do not go to OpenAI.
-           *
-           * The plan remains at the same step so the next tick can
-           * retry it or a new CLI goal can replace it.
+           * Deterministic tasks remain deterministic.
            */
           if (
-            resolvePhase1Command(
-              loadMemory(
-                accountId,
-              ).currentGoal ??
-                '',
-            )
+            latestPhase1 ||
+            latestProvision ||
+            latestCombat ||
+            latestGear
           ) {
             appendHistory(
               accountId,
-              `Phase 1 step '${step.script}' failed: ${result.message}`,
+              `Deterministic step '${step.script}' failed: ${result.message}`,
             );
 
             return;
           }
 
-          /*
-           * Only Phase 2 plans can escalate after repeated failure.
-           */
           if (
             shouldEscalate(
               accountId,
@@ -1020,8 +1418,6 @@ export class Dispatcher {
               0,
             );
 
-            // A new plan is about to be created; clear any backoff
-            // so the first step of the fresh plan can start immediately.
             this.nextRetryAfter.delete(
               accountId,
             );
@@ -1038,18 +1434,11 @@ export class Dispatcher {
           return;
         }
 
-        /*
-         * ----------------------------------------------------------
-         * SUCCESS
-         * ----------------------------------------------------------
-         */
         this.consecutiveFailures.set(
           accountId,
           0,
         );
 
-        // Reset backoff — this step succeeded so the next one may
-        // start without delay.
         this.nextRetryAfter.delete(
           accountId,
         );
@@ -1064,6 +1453,42 @@ export class Dispatcher {
           latest.activePlan.planId !==
             plan.planId
         ) {
+          return;
+        }
+
+        if (
+          latest.userRequest
+        ) {
+          logger.info(
+            {
+              accountId,
+
+              request:
+                latest.userRequest,
+            },
+            'Dispatcher: user request detected before plan advancement',
+          );
+
+          return;
+        }
+
+        if (
+          latest.currentGoal !==
+          memory.currentGoal
+        ) {
+          logger.info(
+            {
+              accountId,
+
+              oldGoal:
+                memory.currentGoal,
+
+              newGoal:
+                latest.currentGoal,
+            },
+            'Dispatcher: goal changed before plan advancement',
+          );
+
           return;
         }
 
@@ -1120,6 +1545,27 @@ export class Dispatcher {
             this.runningTasks.delete(
               accountId,
             );
+          }
+
+          if (
+            controller.signal.aborted
+          ) {
+            logger.info(
+              {
+                accountId,
+
+                planId:
+                  plan.planId,
+
+                stepIndex,
+
+                script:
+                  step.script,
+              },
+              'Dispatcher: cancelled step exited with exception',
+            );
+
+            return;
           }
 
           logger.error(
@@ -1225,9 +1671,11 @@ export class Dispatcher {
       accountId,
     );
 
-    // A cancelled task means a new goal or stop command arrived.
-    // Clear any pending backoff so the fresh goal can start immediately.
     this.nextRetryAfter.delete(
+      accountId,
+    );
+
+    this.consecutiveFailures.delete(
       accountId,
     );
   }
@@ -1359,30 +1807,373 @@ export class Dispatcher {
 }
 
 /* ================================================================
- * COMMAND → PLAN STEP CONVERSION
+ * PROVISION COMMAND RESOLVER
  * ================================================================ */
 
-/**
- * Convert a queued {@link Command} to a single {@link PlanStep} that
- * the Dispatcher can execute using the standard plan machinery.
- *
- * Convention
- * ----------
- * - `travel`  — expects `params.x` and `params.z`; runs `walk_to`.
- * - `gather`  — expects `params.profession` and `params.resource`; uses
- *               `params.script` when supplied, else the profession name.
- * - `generic` — requires `params.script`; all other params are forwarded
- *               as-is.
- *
- * @throws {Error} when the command lacks the required fields.
- */
+function resolveProvisionCommand(
+  goal:
+    string,
+): ProvisionCommand | null {
+  const normalized =
+    goal
+      .trim()
+      .toLowerCase();
+
+  if (
+    normalized ===
+      'provision:food-shrimp' ||
+    normalized ===
+      'provision:shrimp' ||
+    normalized ===
+      'provision:food-shrimps'
+  ) {
+    return {
+      type:
+        'provision_food',
+
+      foodName:
+        'Shrimps',
+
+      rawFoodName:
+        'Raw shrimps',
+
+      targetBankedFood:
+        100,
+
+      fishingLocation:
+        'draynor-fishing',
+
+      bank:
+        'draynor-bank',
+
+      cookingLocation:
+        'draynor-cooking',
+
+      maxFishingRuns:
+        3,
+
+      fishPerRun:
+        26,
+
+      fishingMethod:
+        'net',
+    };
+  }
+
+  return null;
+}
+
+/* ================================================================
+ * COMBAT COMMAND RESOLVER
+ * ================================================================ */
+
+function resolveCombatCommand(
+  goal:
+    string,
+): CombatCommand | null {
+  const normalized =
+    goal
+      .trim()
+      .toLowerCase();
+
+  const prefix =
+    'combat:';
+
+  if (
+    normalized.startsWith(
+      prefix,
+    )
+  ) {
+    const target =
+      normalized
+        .slice(
+          prefix.length,
+        )
+        .trim();
+
+    if (
+      !target
+    ) {
+      return null;
+    }
+
+    const targetDisplay =
+      target.charAt(
+        0,
+      )
+        .toUpperCase() +
+      target.slice(
+        1,
+      );
+
+    return {
+      type:
+        'combat',
+
+      target:
+        targetDisplay,
+    };
+  }
+
+  return null;
+}
+
+/* ================================================================
+ * GEAR COMMAND RESOLVER
+ * ================================================================ */
+
+function resolveGearCommand(
+  goal:
+    string,
+): GearCommand | null {
+  const normalized =
+    goal
+      .trim()
+      .toLowerCase();
+
+  if (
+    normalized ===
+      'gear:bronze' ||
+    normalized ===
+      'bronze:gear'
+  ) {
+    return {
+      type:
+        'bronze_gear',
+    };
+  }
+
+  if (
+    normalized ===
+      'gear:bronze-weapon' ||
+    normalized ===
+      'bronze:weapon'
+  ) {
+    return {
+      type:
+        'bronze_weapon',
+    };
+  }
+
+  return null;
+}
+
+/* ================================================================
+ * COMBAT PLAN BUILDER
+ * ================================================================ */
+
+function buildCombatPlan(
+  command:
+    CombatCommand,
+): ActivePlan {
+  return {
+    planId:
+      `combat-${Date.now()}`,
+
+    goal:
+      `Combat — ${command.target}`,
+
+    currentStepIndex:
+      0,
+
+    onMissingCapability:
+      'invoke_sdk_or_ask_user',
+
+    createdAt:
+      Date.now(),
+
+    steps: [
+      {
+        script:
+          'basic_combat',
+
+        params: {
+          target:
+            command.target,
+
+          foodName:
+            'Shrimps',
+
+          rawFoodName:
+            'Raw shrimps',
+
+          weaponName:
+            '',
+
+          armorNames:
+            [],
+
+          foodWithdraw:
+            14,
+
+          buryBones:
+            true,
+
+          maxTrips:
+            0,
+        },
+
+        description:
+          `Fight ${command.target} until stopped`,
+      },
+    ],
+  };
+}
+
+/* ================================================================
+ * GEAR PLAN BUILDER
+ * ================================================================ */
+
+function buildGearPlan(
+  command:
+    GearCommand,
+): ActivePlan {
+  if (
+    command.type ===
+    'bronze_weapon'
+  ) {
+    return {
+      planId:
+        `gear-bronze-weapon-${Date.now()}`,
+
+      goal:
+        'Obtain bronze weapon',
+
+      currentStepIndex:
+        0,
+
+      onMissingCapability:
+        'invoke_sdk_or_ask_user',
+
+      createdAt:
+        Date.now(),
+
+      steps: [
+        {
+          script:
+            'bronze_weapon_setup',
+
+          params: {},
+
+          description:
+            'Mine copper/tin, smelt bronze bar, smith and equip bronze sword',
+        },
+      ],
+    };
+  }
+
+  return {
+    planId:
+      `gear-bronze-${Date.now()}`,
+
+    goal:
+      'Obtain full bronze gear',
+
+    currentStepIndex:
+      0,
+
+    onMissingCapability:
+      'invoke_sdk_or_ask_user',
+
+    createdAt:
+      Date.now(),
+
+    steps: [
+      {
+        script:
+          'bronze_gear_setup',
+
+        params: {},
+
+        description:
+          'Mine copper/tin, smelt bronze bars, smith and equip full bronze set',
+      },
+    ],
+  };
+}
+
+/* ================================================================
+ * PROVISION PLAN BUILDER
+ * ================================================================ */
+
+function buildProvisionPlan(
+  command:
+    ProvisionCommand,
+): ActivePlan {
+  return {
+    planId:
+      `phase2-provision-food-${Date.now()}`,
+
+    goal:
+      'Provision food — Shrimps',
+
+    currentStepIndex:
+      0,
+
+    onMissingCapability:
+      'invoke_sdk_or_ask_user',
+
+    createdAt:
+      Date.now(),
+
+    steps: [
+      {
+        script:
+          'provision_food',
+
+        params: {
+          foodName:
+            command.foodName,
+
+          rawFoodName:
+            command.rawFoodName,
+
+          targetBankedFood:
+            command.targetBankedFood,
+
+          fishingLocation:
+            command.fishingLocation,
+
+          bank:
+            command.bank,
+
+          cookingLocation:
+            command.cookingLocation,
+
+          maxFishingRuns:
+            command.maxFishingRuns,
+
+          fishPerRun:
+            command.fishPerRun,
+
+          fishingMethod:
+            command.fishingMethod,
+        },
+
+        description:
+          'Provision a safe reserve of cooked shrimp for future combat/recovery tasks',
+      },
+    ],
+  };
+}
+
+/* ================================================================
+ * COMMAND → PLAN STEP
+ * ================================================================ */
+
 function commandToStep(
   command:
     Command,
 ): PlanStep {
-  const { type, params } = command;
+  const {
+    type,
+    params,
+  } =
+    command;
 
-  switch (type) {
+  switch (
+    type
+  ) {
     case 'travel': {
       const x =
         params.x ??
@@ -1404,7 +2195,8 @@ function commandToStep(
       }
 
       const script =
-        typeof params.script === 'string' &&
+        typeof params.script ===
+          'string' &&
         params.script
           ? params.script
           : 'walk_to';
@@ -1414,9 +2206,12 @@ function commandToStep(
 
         params: {
           x,
+
           z,
+
           tolerance:
-            params.tolerance ?? 3,
+            params.tolerance ??
+            3,
         },
 
         description:
@@ -1427,26 +2222,32 @@ function commandToStep(
     case 'gather': {
       const profession =
         String(
-          params.profession ?? '',
+          params.profession ??
+            '',
         );
 
       const resource =
         String(
-          params.resource ?? '',
+          params.resource ??
+            '',
         );
 
       const script =
-        typeof params.script === 'string' &&
+        typeof params.script ===
+          'string' &&
         params.script
           ? params.script
-          : profession || 'gather';
+          : profession ||
+            'gather';
 
       return {
         script,
 
         params: {
           ...params,
+
           profession,
+
           resource,
         },
 
@@ -1458,25 +2259,31 @@ function commandToStep(
     case 'generic':
     default: {
       const script =
-        typeof params.script === 'string'
+        typeof params.script ===
+          'string'
           ? params.script
           : '';
 
-      if (!script) {
+      if (
+        !script
+      ) {
         throw new Error(
           `generic command requires 'script' field in params`,
         );
       }
 
-      /*
-       * Forward every field except 'script' as script params.
-       */
-      const { script: _ignored, ...rest } = params;
+      const {
+        script:
+          _ignored,
+        ...rest
+      } =
+        params;
 
       return {
         script,
 
-        params: rest,
+        params:
+          rest,
 
         description:
           `Run ${script}`,
