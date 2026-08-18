@@ -59,6 +59,9 @@ interface TrainingLocation {
   rebuildAfterMisses?: number;
 
   inventoryThreshold: number;
+
+  /** Optional safe travel waypoints to avoid dangerous NPCs. */
+  safePath?: Array<{ x: number; z: number }>;
 }
 
 /* ================================================================
@@ -239,11 +242,6 @@ const TRAINING_LOCATIONS:
     nodeType:
       'locs',
 
-    /*
-     * The exact world object naming is handled by the
-     * woodcutting implementation. Keep the route broad enough
-     * to discover Oak / Oak tree objects.
-     */
     nodePattern:
       /^oak(?: tree)?$/i,
 
@@ -1072,10 +1070,10 @@ const TRAINING_LOCATIONS:
       'fishing',
 
     x:
-      3087,
+      3098, // east of the dark wizard cluster, still within scan range
 
     z:
-      3227,
+      3230, // slightly north of the actual fishing spots
 
     tolerance:
       3,
@@ -1113,13 +1111,23 @@ const TRAINING_LOCATIONS:
       8,
 
     scanRadius:
-      15,
+      18, // increased to find spots from the safe point
 
     rebuildAfterMisses:
       3,
 
     inventoryThreshold:
       26,
+
+    dangerousNpcPattern:
+      /dark wizard/i,
+
+    safePath: [
+      { x: 3093, z: 3244 }, // bank
+      { x: 3104, z: 3244 }, // east along the road
+      { x: 3104, z: 3230 }, // south along the road
+      { x: 3098, z: 3230 }, // west into the safe fishing area
+    ],
   },
 
   {
@@ -1611,7 +1619,7 @@ registerScript(
       true,
 
     version:
-      2,
+      3,
   },
 
   async (
@@ -1666,13 +1674,6 @@ registerScript(
      * ------------------------------------------------------------
      */
 
-    /*
-     * GatheringCore owns the actual SDK adapter. We therefore use
-     * its state through the context only for location selection.
-     *
-     * The final preparation/gathering controller reconnects through
-     * the shared adapter.
-     */
     const adapter =
       ctx.adapter as any;
 
@@ -1704,21 +1705,8 @@ registerScript(
      * ------------------------------------------------------------
      * REQUESTED LOCATION
      * ------------------------------------------------------------
-     *
-     * THIS IS THE IMPORTANT CHANGE.
-     *
-     * If the caller gives a location explicitly, that location wins.
-     *
-     * We do NOT ask the level selector whether it is appropriate.
-     *
-     * Example:
-     *
-     *   profession = woodcutting
-     *   location   = draynor-oaks
-     *   resource   = oak
-     *
-     * At Woodcutting level 89 this is still valid.
      */
+
     const requestedLocation =
       String(
         params.location ??
@@ -1877,8 +1865,6 @@ registerScript(
      * ------------------------------------------------------------
      * EFFECTIVE PARAMETERS
      * ------------------------------------------------------------
-     *
-     * Explicit params override the preset.
      */
     const effectiveResource =
       String(
@@ -1916,6 +1902,144 @@ registerScript(
 
     /*
      * ------------------------------------------------------------
+     * SAFE PATH OVERRIDE FOR DRAYNOR FISHING
+     * ------------------------------------------------------------
+     * If the selected location has a safePath, we pre-walk the
+     * player along that path to avoid dangerous NPCs before
+     * entering the main gathering loop.
+     */
+    if (
+      selected.safePath &&
+      selected.safePath.length > 1 &&
+      typeof adapter.walkTo === 'function'
+    ) {
+      console.log(
+        `[Gather] Following safe path for ${selected.name}...`,
+      );
+
+      const player =
+        adapter.getState?.()
+          ?.player as any;
+
+      if (
+        !player
+      ) {
+        return {
+          success:
+            false,
+
+          message:
+            'Player state unavailable for safe path.',
+
+          data: {
+            reason:
+              'state_unavailable',
+          },
+        };
+      }
+
+      const currentX =
+        Number(
+          player.worldX ??
+            player.x ??
+            0,
+        );
+
+      const currentZ =
+        Number(
+          player.worldZ ??
+            player.z ??
+            0,
+        );
+
+      // Find the closest safe path point to current position.
+      let closestIndex =
+        0;
+
+      let closestDistance =
+        Number.POSITIVE_INFINITY;
+
+      selected.safePath.forEach(
+        (
+          point,
+          index,
+        ) => {
+          const distance =
+            Math.hypot(
+              currentX -
+                point.x,
+
+              currentZ -
+                point.z,
+            );
+
+          if (
+            distance <
+            closestDistance
+          ) {
+            closestDistance =
+              distance;
+
+            closestIndex =
+              index;
+          }
+        },
+      );
+
+      // Walk through the safe path from the closest point onward.
+      for (
+        let i =
+          closestIndex;
+
+        i <
+        selected.safePath.length;
+
+        i++
+      ) {
+        const point =
+          selected.safePath[i];
+
+        console.log(
+          `[Gather] Safe path waypoint: (${point.x}, ${point.z})`,
+        );
+
+        const walkResult =
+          await adapter.walkTo(
+            point.x,
+            point.z,
+            2,
+          );
+
+        if (
+          !walkResult.success
+        ) {
+          return {
+            success:
+              false,
+
+            message:
+              `Safe path walk failed at (${point.x}, ${point.z}): ${walkResult.message}`,
+
+            data: {
+              reason:
+                'safe_path_failed',
+
+              waypoint:
+                point,
+
+              walkResult,
+            },
+          };
+        }
+      }
+
+      console.log(
+        `[Gather] Safe path completed for ${selected.name}.`,
+      );
+    }
+
+    /*
+     * ------------------------------------------------------------
      * GATHERING CORE CONFIGURATION
      * ------------------------------------------------------------
      */
@@ -1935,10 +2059,6 @@ registerScript(
         effectiveTarget,
     };
 
-    /*
-     * The profession-specific gathering scripts can use these
-     * parameters where appropriate.
-     */
     if (
       profession ===
       'woodcutting'
@@ -2093,10 +2213,6 @@ function selectAutomaticLocation(
           a,
           b,
         ) => {
-          /*
-           * Prefer the highest available training tier, but among
-           * equally suitable locations prefer the closest one.
-           */
           const levelDifference =
             b.minLevel -
             a.minLevel;
@@ -2287,22 +2403,12 @@ function getGatherScript(
     profession
   ) {
     case 'woodcutting':
-      /*
-       * Gather Core passes targetX/targetZ into gather_wood.
-       */
       return 'gather_wood';
 
     case 'mining':
-      /*
-       * Gather Core passes targetX/targetZ into gather_ore.
-       */
       return 'gather_ore';
 
     case 'fishing':
-      /*
-       * Gather Core passes targetX/targetZ into
-       * use_fishing_script.
-       */
       return 'use_fishing_script';
   }
 }
@@ -2366,3 +2472,4 @@ function parseMaxCycles(
     ),
   );
 }
+

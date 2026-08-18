@@ -14,7 +14,9 @@ import type {
   ScriptResult,
 } from "../scripts/types.js";
 
-import { updateAccountMemoryFromAdapter } from "../state/game-state-sync.js";
+import {
+  updateAccountMemoryFromAdapter,
+} from "../state/game-state-sync.js";
 
 export interface GatheringLocation {
   name: string;
@@ -65,6 +67,12 @@ export interface GatheringCoreConfig {
 
   inventoryThreshold: number;
 
+  /*
+   * Gathering is deliberately conservative.
+   *
+   * Default:
+   *   70% HP = retreat threshold
+   */
   hpStopPercent?: number;
 
   dangerousNpcPattern?: RegExp;
@@ -102,11 +110,9 @@ export async function runGatheringCore(
   /*
    * Resolve adapter in priority order:
    *
-   *   1. A shared adapter already attached to `ctx.adapter` (supplied by the
-   *      caller or a parent script — highest priority).
-   *   2. The shared adapter pool from `ctx.adapterPool` (one long-lived
-   *      WebSocket per account).
-   *   3. A fresh adapter created here (legacy fallback).
+   *   1. Shared adapter already attached to ctx.adapter.
+   *   2. Shared adapter pool from ctx.adapterPool.
+   *   3. Fresh adapter created here.
    */
   const suppliedAdapter =
     ctx.adapter as any;
@@ -115,9 +121,9 @@ export async function runGatheringCore(
     (obj: unknown): obj is RsSdkAdapter =>
       Boolean(
         obj &&
-        typeof (obj as any).connect === 'function' &&
-        typeof (obj as any).disconnect === 'function' &&
-        typeof (obj as any).getState === 'function',
+        typeof (obj as any).connect === "function" &&
+        typeof (obj as any).disconnect === "function" &&
+        typeof (obj as any).getState === "function",
       );
 
   let adapter:
@@ -164,7 +170,7 @@ export async function runGatheringCore(
   }
 
   /*
-   * All child scripts receive the same live adapter.
+   * Every child script gets the same live adapter.
    */
   const sharedContext:
     ScriptContext = {
@@ -185,22 +191,29 @@ export async function runGatheringCore(
           config.maxCycles ?? 1,
         );
 
+  /*
+   * Conservative safety threshold.
+   *
+   * The previous 50% default was too late. If the account has
+   * 12 HP, 70% means retreating at 8 HP or below.
+   */
   const hpStopPercent =
     config.hpStopPercent ??
-    0.50;
+    0.70;
 
   /*
    * Persistent route.
    *
-   * It survives banking. It is rebuilt only after enough consecutive
-   * node failures.
+   * It survives banking and danger recovery.
    */
   let nodeRoute:
     GatheringNode[] = [];
 
-  let routeIndex = 0;
+  let routeIndex =
+    0;
 
-  let nodeMisses = 0;
+  let nodeMisses =
+    0;
 
   const rebuildAfterMisses =
     Math.max(
@@ -209,7 +222,8 @@ export async function runGatheringCore(
         3,
     );
 
-  let cycle = 1;
+  let cycle =
+    1;
 
   try {
     await adapter.connect();
@@ -266,6 +280,13 @@ export async function runGatheringCore(
        * ------------------------------------------------------------
        * HP SAFETY
        * ------------------------------------------------------------
+       *
+       * We do NOT allow the dispatcher to keep retrying while the
+       * character is dying.
+       *
+       * At or below the threshold:
+       *
+       *   gather -> retreat -> recover -> continue
        */
       const hp =
         Number(
@@ -282,60 +303,159 @@ export async function runGatheringCore(
         hp / maxHp <=
           hpStopPercent
       ) {
-        return {
-          success: false,
+        console.log(
+          `[Gathering] HP emergency: ${hp}/${maxHp}. Retreating to ${config.bank.name}.`,
+        );
 
-          message:
-            `HP below gathering threshold: ${hp}/${maxHp}`,
+        const retreat =
+          await retreatToBank(
+            adapter,
+            config.bank,
+          );
 
-          data: {
-            cycle,
+        if (
+          !retreat.success
+        ) {
+          return {
+            success:
+              false,
 
-            action:
-              "recover_hp",
+            message:
+              `HP emergency and retreat failed: ${retreat.message}`,
 
-            hp,
+            data: {
+              cycle,
 
-            maxHp,
+              action:
+                "emergency_retreat",
 
-            reason:
-              "low_hp",
-          },
-        };
+              hp,
+
+              maxHp,
+
+              reason:
+                "low_hp",
+
+              ...(retreat.data ?? {}),
+            },
+          };
+        }
+
+        /*
+         * Let the player regenerate before attempting another cycle.
+         */
+        await waitForTicksSafe(
+          adapter,
+          10,
+        );
+
+        cycle++;
+
+        continue;
       }
 
       /*
        * ------------------------------------------------------------
        * DANGER
        * ------------------------------------------------------------
+       *
+       * Danger is recoverable.
+       *
+       * IMPORTANT:
+       *
+       * "none", "null", "undefined" and empty combat targets are
+       * never treated as real enemies.
        */
+      const nearbyNpcs =
+        adapter.getNearbyNpcs();
+
       const danger =
         detectDanger(
           state,
-          adapter.getNearbyNpcs(),
+          nearbyNpcs,
           config.dangerousNpcPattern,
         );
 
-      if (danger) {
-        return {
-          success: false,
+      if (
+        danger
+      ) {
+        console.log(
+          `[Gathering] Danger detected: ${danger}. Attempting recovery...`,
+        );
 
-          message:
-            `Danger detected: ${danger}`,
+        const escapeResult =
+          await escapeDanger(
+            adapter,
+            config.resource,
+            danger,
+          );
 
-          data: {
-            cycle,
+        if (
+          !escapeResult.success
+        ) {
+          return {
+            success:
+              false,
 
-            action:
-              "escape_danger",
+            message:
+              `Could not escape danger: ${escapeResult.message}`,
 
-            npc:
-              danger,
+            data: {
+              cycle,
 
-            reason:
-              "danger_detected",
-          },
-        };
+              action:
+                "escape_danger",
+
+              npc:
+                danger,
+
+              reason:
+                "danger_escape_failed",
+
+              ...(escapeResult.data ??
+                {}),
+            },
+          };
+        }
+
+        await waitForTicksSafe(
+          adapter,
+          4,
+        );
+
+        /*
+         * Re-check after escaping.
+         */
+        const safeState =
+          adapter.getState();
+
+        const safeDanger =
+          detectDanger(
+            safeState,
+            adapter.getNearbyNpcs(),
+            config.dangerousNpcPattern,
+          );
+
+        if (
+          safeDanger
+        ) {
+          console.log(
+            `[Gathering] Danger is still present (${safeDanger}); staying away temporarily.`,
+          );
+
+          await waitForTicksSafe(
+            adapter,
+            6,
+          );
+
+          continue;
+        }
+
+        console.log(
+          "[Gathering] Danger cleared. Resuming gathering.",
+        );
+
+        continue;
       }
 
       /*
@@ -368,7 +488,8 @@ export async function runGatheringCore(
           !bankResult.success
         ) {
           return {
-            success: false,
+            success:
+              false,
 
             message:
               bankResult.message,
@@ -384,10 +505,6 @@ export async function runGatheringCore(
           };
         }
 
-        /*
-         * Keep the route if it is still valid.
-         * We do not automatically rebuild simply because we banked.
-         */
         continue;
       }
 
@@ -412,7 +529,8 @@ export async function runGatheringCore(
         !prepareResult.success
       ) {
         return {
-          success: false,
+          success:
+            false,
 
           message:
             `Preparation failed: ${prepareResult.message}`,
@@ -444,7 +562,8 @@ export async function runGatheringCore(
         !equipmentCheck.success
       ) {
         return {
-          success: false,
+          success:
+            false,
 
           message:
             equipmentCheck.message,
@@ -466,7 +585,8 @@ export async function runGatheringCore(
        * ------------------------------------------------------------
        */
       let currentNode:
-        GatheringNode | undefined;
+        GatheringNode |
+        undefined;
 
       if (
         config.nodeRoute?.enabled
@@ -483,10 +603,6 @@ export async function runGatheringCore(
            * --------------------------------------------------------
            * TRAVEL TO RESOURCE BEFORE SCANNING
            * --------------------------------------------------------
-           *
-           * This is essential after banking or after stale node
-           * failures. The player may be standing at the bank, where
-           * resource nodes do not exist.
            */
           const current =
             adapter.getState()
@@ -537,7 +653,8 @@ export async function runGatheringCore(
               !travel.success
             ) {
               return {
-                success: false,
+                success:
+                  false,
 
                 message:
                   `Could not reach ${config.resource.name}: ${travel.message}`,
@@ -557,13 +674,74 @@ export async function runGatheringCore(
             }
           }
 
-          /*
-           * Let the live world state update after arrival.
-           */
           await waitForTicksSafe(
             adapter,
             2,
           );
+
+          /*
+           * Check for danger immediately after reaching the
+           * resource area.
+           */
+          const resourceState =
+            adapter.getState();
+
+          const resourceDanger =
+            detectDanger(
+              resourceState,
+              adapter.getNearbyNpcs(),
+              config.dangerousNpcPattern,
+            );
+
+          if (
+            resourceDanger
+          ) {
+            console.log(
+              `[Gathering] Danger detected at resource area: ${resourceDanger}. Escaping before route scan...`,
+            );
+
+            const escapeResult =
+              await escapeDanger(
+                adapter,
+                config.resource,
+                resourceDanger,
+              );
+
+            if (
+              !escapeResult.success
+            ) {
+              return {
+                success:
+                  false,
+
+                message:
+                  `Could not escape resource-area danger: ${escapeResult.message}`,
+
+                data: {
+                  cycle,
+
+                  action:
+                    "escape_danger",
+
+                  npc:
+                    resourceDanger,
+
+                  reason:
+                    "danger_escape_failed",
+
+                  ...(escapeResult.data ??
+                    {}),
+                },
+              };
+            }
+
+            await waitForTicksSafe(
+              adapter,
+              5,
+            );
+
+            continue;
+          }
 
           console.log(
             `[Gathering] Scanning ${config.nodeRoute.nodeType} for resource nodes (radius ${config.nodeRoute.scanRadius ?? 15})...`,
@@ -581,9 +759,6 @@ export async function runGatheringCore(
           nodeMisses =
             0;
 
-          /*
-           * Retry once after a short state-refresh delay.
-           */
           if (
             nodeRoute.length ===
             0
@@ -605,7 +780,8 @@ export async function runGatheringCore(
             0
           ) {
             return {
-              success: false,
+              success:
+                false,
 
               message:
                 `No ${config.profession} resource nodes found near ${config.resource.name}`,
@@ -670,7 +846,7 @@ export async function runGatheringCore(
         );
 
         /*
-         * Walk to the saved node.
+         * Walk to saved node.
          */
         const travel =
           await adapter.walkTo(
@@ -689,6 +865,78 @@ export async function runGatheringCore(
           );
 
           routeIndex++;
+
+          continue;
+        }
+
+        /*
+         * ----------------------------------------------------------
+         * DANGER AT ACTUAL NODE
+         * ----------------------------------------------------------
+         */
+        const nodeState =
+          adapter.getState();
+
+        const nodeDanger =
+          detectDanger(
+            nodeState,
+            adapter.getNearbyNpcs(),
+            config.dangerousNpcPattern,
+          );
+
+        if (
+          nodeDanger
+        ) {
+          console.log(
+            `[Gathering] Node ${currentNode.name} is unsafe because of ${nodeDanger}. Skipping this node.`,
+          );
+
+          nodeMisses++;
+
+          routeIndex++;
+
+          const escapeResult =
+            await escapeDanger(
+              adapter,
+              config.resource,
+              nodeDanger,
+            );
+
+          if (
+            !escapeResult.success
+          ) {
+            return {
+              success:
+                false,
+
+              message:
+                `Could not move away from dangerous node: ${escapeResult.message}`,
+
+              data: {
+                cycle,
+
+                action:
+                  "escape_danger",
+
+                npc:
+                  nodeDanger,
+
+                node:
+                  currentNode.name,
+
+                reason:
+                  "danger_escape_failed",
+
+                ...(escapeResult.data ??
+                  {}),
+              },
+            };
+          }
+
+          await waitForTicksSafe(
+            adapter,
+            3,
+          );
 
           continue;
         }
@@ -747,7 +995,8 @@ export async function runGatheringCore(
             !travel.success
           ) {
             return {
-              success: false,
+              success:
+                false,
 
               message:
                 `Could not reach ${config.resource.name}: ${travel.message}`,
@@ -778,7 +1027,7 @@ export async function runGatheringCore(
 
       /*
        * ------------------------------------------------------------
-       * DANGER AFTER TRAVEL
+       * SECOND DANGER CHECK
        * ------------------------------------------------------------
        */
       const travelState =
@@ -794,25 +1043,51 @@ export async function runGatheringCore(
       if (
         travelDanger
       ) {
-        return {
-          success: false,
+        console.log(
+          `[Gathering] Danger detected after travel: ${travelDanger}. Escaping and retrying.`,
+        );
 
-          message:
-            `Danger detected at resource area: ${travelDanger}`,
+        const escapeResult =
+          await escapeDanger(
+            adapter,
+            config.resource,
+            travelDanger,
+          );
 
-          data: {
-            cycle,
+        if (
+          !escapeResult.success
+        ) {
+          return {
+            success:
+              false,
 
-            action:
-              "escape_danger",
+            message:
+              `Could not escape travel-area danger: ${escapeResult.message}`,
 
-            npc:
-              travelDanger,
+            data: {
+              cycle,
 
-            reason:
-              "danger_detected",
-          },
-        };
+              action:
+                "escape_danger",
+
+              npc:
+                travelDanger,
+
+              reason:
+                "danger_escape_failed",
+
+              ...(escapeResult.data ??
+                {}),
+            },
+          };
+        }
+
+        await waitForTicksSafe(
+          adapter,
+          4,
+        );
+
+        continue;
       }
 
       /*
@@ -856,7 +1131,9 @@ export async function runGatheringCore(
           String(
             gatherResult.data?.reason ??
               "",
-          );
+          )
+            .trim()
+            .toLowerCase();
 
         /*
          * ----------------------------------------------------------
@@ -870,11 +1147,6 @@ export async function runGatheringCore(
           console.log(
             "[Gathering] Inventory full; banking next.",
           );
-
-          /*
-           * Do not advance the route here.
-           * The next loop iteration will bank.
-           */
         }
 
         /*
@@ -888,6 +1160,10 @@ export async function runGatheringCore(
             reason ===
               "resource_not_found" ||
             reason ===
+              "node_not_found" ||
+            reason ===
+              "node_unavailable" ||
+            reason ===
               "timeout" ||
             /timed out/i.test(
               gatherResult.message,
@@ -897,26 +1173,154 @@ export async function runGatheringCore(
           nodeMisses++;
 
           console.log(
-            `[Gathering] Saved node unavailable or timed out. ` +
-            `Skipping node. Miss ${nodeMisses}/${rebuildAfterMisses}.`,
+            `[Gathering] Saved node unavailable or timed out. Skipping node. Miss ${nodeMisses}/${rebuildAfterMisses}.`,
           );
 
           if (
             currentNode
           ) {
             console.log(
-              `[Gathering] Skipping ${currentNode.name} ` +
-              `(${currentNode.x}, ${currentNode.z}).`,
+              `[Gathering] Skipping ${currentNode.name} (${currentNode.x}, ${currentNode.z}).`,
             );
           }
 
           routeIndex++;
 
+          continue;
+        }
+
+        /*
+         * ----------------------------------------------------------
+         * DANGER REPORTED BY CHILD SCRIPT
+         * ----------------------------------------------------------
+         */
+        else if (
+          reason ===
+            "danger_detected" ||
+          reason ===
+            "escape_danger"
+        ) {
+          const childDanger =
+            normaliseDangerName(
+              gatherResult.data?.npc ??
+                gatherResult.data?.target ??
+                gatherResult.data?.targetName ??
+                "",
+            );
+
           /*
-           * Rebuild will occur on the next cycle if the miss
-           * threshold has been reached. The rebuild code will first
-           * travel back to config.resource before scanning.
+           * If the child says "none", do not invent a danger event.
            */
+          if (
+            !childDanger
+          ) {
+            console.log(
+              "[Gathering] Child script reported a non-specific/empty danger state. Re-checking instead of fleeing.",
+            );
+
+            await waitForTicksSafe(
+              adapter,
+              2,
+            );
+
+            continue;
+          }
+
+          console.log(
+            `[Gathering] Child gathering script reported danger: ${childDanger}. Recovering.`,
+          );
+
+          const escapeResult =
+            await escapeDanger(
+              adapter,
+              config.resource,
+              childDanger,
+            );
+
+          if (
+            !escapeResult.success
+          ) {
+            return {
+              success:
+                false,
+
+              message:
+                `Could not recover from child-script danger: ${escapeResult.message}`,
+
+              data: {
+                cycle,
+
+                action:
+                  "escape_danger",
+
+                npc:
+                  childDanger,
+
+                reason:
+                  "danger_escape_failed",
+
+                ...(escapeResult.data ??
+                  {}),
+              },
+            };
+          }
+
+          await waitForTicksSafe(
+            adapter,
+            4,
+          );
+
+          continue;
+        }
+
+        /*
+         * ----------------------------------------------------------
+         * LOW HP FROM CHILD SCRIPT
+         * ----------------------------------------------------------
+         */
+        else if (
+          reason ===
+          "low_hp"
+        ) {
+          console.log(
+            "[Gathering] Child script reported low HP. Emergency retreat.",
+          );
+
+          const retreat =
+            await retreatToBank(
+              adapter,
+              config.bank,
+            );
+
+          if (
+            !retreat.success
+          ) {
+            return {
+              success:
+                false,
+
+              message:
+                `Low HP retreat failed: ${retreat.message}`,
+
+              data: {
+                cycle,
+
+                action:
+                  "emergency_retreat",
+
+                reason:
+                  "retreat_failed",
+
+                ...(retreat.data ?? {}),
+              },
+            };
+          }
+
+          await waitForTicksSafe(
+            adapter,
+            10,
+          );
+
           continue;
         }
 
@@ -927,7 +1331,8 @@ export async function runGatheringCore(
          */
         else {
           return {
-            success: false,
+            success:
+              false,
 
             message:
               `Gathering failed: ${gatherResult.message}`,
@@ -954,9 +1359,6 @@ export async function runGatheringCore(
       ) {
         routeIndex++;
 
-        /*
-         * A successful node clears consecutive node failures.
-         */
         nodeMisses =
           0;
       }
@@ -993,28 +1395,54 @@ export async function runGatheringCore(
             afterMaxHp <=
             hpStopPercent
         ) {
-          return {
-            success: false,
+          console.log(
+            `[Gathering] HP dropped to ${afterHp}/${afterMaxHp}. Emergency retreat.`,
+          );
 
-            message:
-              `HP dropped below threshold after gathering: ${afterHp}/${afterMaxHp}`,
+          const retreat =
+            await retreatToBank(
+              adapter,
+              config.bank,
+            );
 
-            data: {
-              cycle,
+          if (
+            !retreat.success
+          ) {
+            return {
+              success:
+                false,
 
-              action:
-                "recover_hp",
+              message:
+                `HP emergency retreat failed: ${retreat.message}`,
 
-              hp:
-                afterHp,
+              data: {
+                cycle,
 
-              maxHp:
-                afterMaxHp,
+                action:
+                  "emergency_retreat",
 
-              reason:
-                "low_hp",
-            },
-          };
+                hp:
+                  afterHp,
+
+                maxHp:
+                  afterMaxHp,
+
+                reason:
+                  "retreat_failed",
+
+                ...(retreat.data ?? {}),
+              },
+            };
+          }
+
+          await waitForTicksSafe(
+            adapter,
+            10,
+          );
+
+          cycle++;
+
+          continue;
         }
       }
 
@@ -1048,7 +1476,8 @@ export async function runGatheringCore(
           !bankResult.success
         ) {
           return {
-            success: false,
+            success:
+              false,
 
             message:
               bankResult.message,
@@ -1063,14 +1492,23 @@ export async function runGatheringCore(
             },
           };
         }
+
+        console.log(
+          `[Gathering] Banking completed at ${config.bank.name}.`,
+        );
       }
 
       console.log(
         `[Gathering] Cycle ${cycle} complete. Continuing...`,
       );
 
-      // Persist live adapter state to SQLite so the Planner sees fresh data.
-      await updateAccountMemoryFromAdapter(adapter, ctx.accountId);
+      /*
+       * Persist current live state.
+       */
+      await updateAccountMemoryFromAdapter(
+        adapter,
+        ctx.accountId,
+      );
 
       cycle++;
     }
@@ -1081,7 +1519,8 @@ export async function runGatheringCore(
      * --------------------------------------------------------------
      */
     return {
-      success: true,
+      success:
+        true,
 
       message:
         config.cancelSignal?.aborted
@@ -1097,21 +1536,23 @@ export async function runGatheringCore(
         cycle,
       },
     };
-  } catch (error) {
+  } catch (
+    error
+  ) {
     return failure(
       error instanceof Error
         ? error.message
         : String(error),
-      undefined,
+      cycle,
       "exception",
     );
   } finally {
     /*
      * Lifecycle rules:
      *
-     *   - Pooled adapter: call release() — the pool keeps it alive.
-     *   - Supplied adapter: owned by the caller — do not disconnect.
-     *   - Fresh adapter created by this core: disconnect and clean up.
+     *   - Pooled adapter: release.
+     *   - Supplied adapter: caller owns it.
+     *   - Fresh adapter: disconnect.
      */
     if (
       usedPool &&
@@ -1126,7 +1567,11 @@ export async function runGatheringCore(
       ) &&
       !usedPool
     ) {
-      await adapter.disconnect();
+      try {
+        await adapter.disconnect();
+      } catch {
+        // Ignore cleanup errors.
+      }
     }
   }
 }
@@ -1169,9 +1614,12 @@ function verifyGatheringEquipment(
           ),
       );
 
-    if (!axe) {
+    if (
+      !axe
+    ) {
       return {
-        success: false,
+        success:
+          false,
 
         message:
           "Woodcutting requires an axe, but no axe is available.",
@@ -1191,7 +1639,8 @@ function verifyGatheringEquipment(
     );
 
     return {
-      success: true,
+      success:
+        true,
 
       message:
         `Axe verified: ${axe.name}`,
@@ -1220,9 +1669,12 @@ function verifyGatheringEquipment(
           ),
       );
 
-    if (!pickaxe) {
+    if (
+      !pickaxe
+    ) {
       return {
-        success: false,
+        success:
+          false,
 
         message:
           "Mining requires a pickaxe, but no pickaxe is available.",
@@ -1242,7 +1694,8 @@ function verifyGatheringEquipment(
     );
 
     return {
-      success: true,
+      success:
+        true,
 
       message:
         `Pickaxe verified: ${pickaxe.name}`,
@@ -1281,9 +1734,12 @@ function verifyGatheringEquipment(
         ),
     );
 
-  if (!fishingTool) {
+  if (
+    !fishingTool
+  ) {
     return {
-      success: false,
+      success:
+        false,
 
       message:
         `Fishing requires ${equipment.source} for method "${method}", but the required equipment is not available.`,
@@ -1305,7 +1761,8 @@ function verifyGatheringEquipment(
   );
 
   return {
-    success: true,
+    success:
+      true,
 
     message:
       `Fishing equipment verified: ${fishingTool.name}`,
@@ -1320,10 +1777,14 @@ function verifyGatheringEquipment(
 }
 
 function getFishingEquipmentPattern(
-  method: string,
+  method:
+    string,
 ): {
-  source: string;
-  regex: RegExp;
+  source:
+    string;
+
+  regex:
+    RegExp;
 } {
   switch (
     method
@@ -1405,14 +1866,14 @@ async function buildNodeRoute(
     Math.max(
       1,
       routeConfig.scanRadius ??
-        15,
+        8,
     );
 
   const maxNodes =
     Math.max(
       1,
       routeConfig.maxNodes ??
-        12,
+        6,
     );
 
   let objects:
@@ -1450,17 +1911,81 @@ async function buildNodeRoute(
         (object: any) =>
           !/stump/i.test(
             String(
-              object?.name ?? "",
+              object?.name ??
+                "",
             ),
           ),
       );
   }
 
   /*
-   * If the current state does not contain matching locations,
-   * try the optional SDK location scanner.
+   * Filter objects to the configured scan radius around the player.
    *
-   * Fishing uses NPC state directly.
+   * This prevents the route from spanning an unnecessarily large
+   * area when the SDK returns a wide set of nearby locations.
+   */
+  const playerForScan =
+    adapter.getState()
+      ?.player as any;
+
+  if (
+    playerForScan
+  ) {
+    const scanX =
+      Number(
+        playerForScan.worldX ??
+          playerForScan.x ??
+          0,
+      );
+
+    const scanZ =
+      Number(
+        playerForScan.worldZ ??
+          playerForScan.z ??
+          0,
+      );
+
+    objects =
+      objects.filter(
+        (object: any) => {
+          const objectX =
+            Number(
+              object?.x ??
+                object?.worldX,
+            );
+
+          const objectZ =
+            Number(
+              object?.z ??
+                object?.worldZ,
+            );
+
+          if (
+            !Number.isFinite(
+              objectX,
+            ) ||
+            !Number.isFinite(
+              objectZ,
+            )
+          ) {
+            return false;
+          }
+
+          return (
+            tileDistance(
+              scanX,
+              scanZ,
+              objectX,
+              objectZ,
+            ) <=
+            radius
+          );
+        },
+      );
+  }
+
+  /*
+   * Fallback SDK scanner.
    */
   if (
     objects.length ===
@@ -1499,21 +2024,16 @@ async function buildNodeRoute(
                 ),
             );
 
-          if (
-            routeConfig.nodeType ===
-            "locs"
-          ) {
-            objects =
-              objects.filter(
-                (object: any) =>
-                  !/stump/i.test(
-                    String(
-                      object?.name ??
-                        "",
-                    ),
+          objects =
+            objects.filter(
+              (object: any) =>
+                !/stump/i.test(
+                  String(
+                    object?.name ??
+                      "",
                   ),
-              );
-          }
+                ),
+            );
         }
       }
     } catch {
@@ -1533,21 +2053,28 @@ async function buildNodeRoute(
     >();
 
   for (
-    const object of objects
+    const object of
+      objects
   ) {
     const x =
       Number(
-        object?.x,
+        object?.x ??
+          object?.worldX,
       );
 
     const z =
       Number(
-        object?.z,
+        object?.z ??
+          object?.worldZ,
       );
 
     if (
-      !Number.isFinite(x) ||
-      !Number.isFinite(z)
+      !Number.isFinite(
+        x,
+      ) ||
+      !Number.isFinite(
+        z,
+      )
     ) {
       continue;
     }
@@ -1558,7 +2085,9 @@ async function buildNodeRoute(
           "",
       );
 
-    if (!name) {
+    if (
+      !name
+    ) {
       continue;
     }
 
@@ -1566,7 +2095,9 @@ async function buildNodeRoute(
       `${x}:${z}`;
 
     if (
-      !unique.has(key)
+      !unique.has(
+        key,
+      )
     ) {
       unique.set(
         key,
@@ -1592,7 +2123,9 @@ async function buildNodeRoute(
     adapter.getState()
       ?.player as any;
 
-  if (!player) {
+  if (
+    !player
+  ) {
     return nodes.slice(
       0,
       maxNodes,
@@ -1601,12 +2134,16 @@ async function buildNodeRoute(
 
   let currentX =
     Number(
-      player.worldX ?? 0,
+      player.worldX ??
+        player.x ??
+        0,
     );
 
   let currentZ =
     Number(
-      player.worldZ ?? 0,
+      player.worldZ ??
+        player.z ??
+        0,
     );
 
   const remaining =
@@ -1634,7 +2171,9 @@ async function buildNodeRoute(
       const candidate =
         remaining[i];
 
-      if (!candidate) {
+      if (
+        !candidate
+      ) {
         continue;
       }
 
@@ -1671,7 +2210,9 @@ async function buildNodeRoute(
         1,
       )[0];
 
-    if (!next) {
+    if (
+      !next
+    ) {
       break;
     }
 
@@ -1704,9 +2245,12 @@ async function bankAndReset(
     adapter.getState()
       ?.player as any;
 
-  if (!player) {
+  if (
+    !player
+  ) {
     return {
-      success: false,
+      success:
+        false,
 
       message:
         "Player state unavailable before banking",
@@ -1721,10 +2265,14 @@ async function bankAndReset(
   const distance =
     tileDistance(
       Number(
-        player.worldX ?? 0,
+        player.worldX ??
+          player.x ??
+          0,
       ),
       Number(
-        player.worldZ ?? 0,
+        player.worldZ ??
+          player.z ??
+          0,
       ),
       bank.x,
       bank.z,
@@ -1828,7 +2376,114 @@ async function bankAndReset(
 }
 
 /* ================================================================
- * DANGER
+ * EMERGENCY RETREAT
+ * ================================================================ */
+
+async function retreatToBank(
+  adapter:
+    RsSdkAdapter,
+
+  bank:
+    GatheringLocation,
+): Promise<ScriptResult> {
+  const player =
+    adapter.getState()
+      ?.player as any;
+
+  if (
+    !player
+  ) {
+    return {
+      success:
+        false,
+
+      message:
+        "Player state unavailable during emergency retreat",
+
+      data: {
+        reason:
+          "state_unavailable",
+      },
+    };
+  }
+
+  console.log(
+    `[Gathering] Emergency retreat -> ${bank.name} (${bank.x}, ${bank.z})`,
+  );
+
+  const walk =
+    await adapter.walkTo(
+      bank.x,
+      bank.z,
+      bank.tolerance ??
+        6,
+    );
+
+  if (
+    !walk.success
+  ) {
+    return {
+      success:
+        false,
+
+      message:
+        `Emergency retreat failed: ${walk.message}`,
+
+      data: {
+        reason:
+          "retreat_failed",
+
+        bank:
+          bank.name,
+
+        ...(walk.data ?? {}),
+      },
+    };
+  }
+
+  console.log(
+    `[Gathering] Emergency retreat reached ${bank.name}.`,
+  );
+
+  /*
+   * Once at the bank, try to eat if a food routine already exists.
+   * We deliberately do not assume a specific food script here.
+   */
+  try {
+    const bankOpen =
+      await adapter.openBank();
+
+    if (
+      bankOpen.success
+    ) {
+      await adapter.closeBank();
+    }
+  } catch {
+    /*
+     * Reaching the safe point is the important part. Ignore optional
+     * bank-state cleanup errors.
+     */
+  }
+
+  return {
+    success:
+      true,
+
+    message:
+      `Emergency retreat reached ${bank.name}`,
+
+    data: {
+      reason:
+        "retreated_to_bank",
+
+      bank:
+        bank.name,
+    },
+  };
+}
+
+/* ================================================================
+ * DANGER DETECTION
  * ================================================================ */
 
 function detectDanger(
@@ -1844,40 +2499,385 @@ function detectDanger(
   const player =
     (state as any)?.player;
 
+  /*
+   * ------------------------------------------------------------
+   * COMBAT STATE
+   * ------------------------------------------------------------
+   *
+   * Only report actual combat. Never report "none", empty strings,
+   * null-like values, or placeholders as an enemy.
+   */
+  const combat =
+    player?.combat;
+
   if (
-    player?.combat?.inCombat
+    combat?.inCombat === true
   ) {
+    const target =
+      normaliseDangerName(
+        combat.targetName ??
+          combat.target ??
+          combat.targetType ??
+          "",
+      );
+
+    /*
+     * We know the player is in combat even if the SDK does not give
+     * us the target name.
+     */
     return (
-      player.combat.targetType ??
+      target ||
       "combat"
     );
   }
 
-  if (!pattern) {
+  /*
+   * ------------------------------------------------------------
+   * NPC PATTERN
+   * ------------------------------------------------------------
+   */
+  if (
+    !pattern
+  ) {
     return null;
   }
 
-  const dangerousNpc =
-    nearbyNpcs.find(
-      (npc: any) =>
-        testRegex(
-          pattern,
-          String(
-            npc?.name ?? "",
-          ),
-        ),
+  if (
+    !Array.isArray(
+      nearbyNpcs,
+    )
+  ) {
+    return null;
+  }
+
+  const playerX =
+    Number(
+      player?.worldX ??
+        player?.x ??
+        0,
     );
 
-  return dangerousNpc
-    ? String(
-        dangerousNpc.name,
-      )
-    : null;
+  const playerZ =
+    Number(
+      player?.worldZ ??
+        player?.z ??
+        0,
+    );
+
+  const maxDangerDistance =
+    6;
+
+  const dangerousNpc =
+    nearbyNpcs.find(
+      (npc: any) => {
+        if (
+          !npc ||
+          typeof npc.name !==
+            "string"
+        ) {
+          return false;
+        }
+
+        const npcName =
+          normaliseDangerName(
+            npc.name,
+          );
+
+        if (
+          !npcName
+        ) {
+          return false;
+        }
+
+        if (
+          !testRegex(
+            pattern,
+            npcName,
+          )
+        ) {
+          return false;
+        }
+
+        const npcX =
+          Number(
+            npc.worldX ??
+              npc.x,
+          );
+
+        const npcZ =
+          Number(
+            npc.worldZ ??
+              npc.z,
+          );
+
+        /*
+         * Missing NPC coordinates means we cannot safely decide that
+         * the NPC is actually near the player.
+         */
+        if (
+          !Number.isFinite(
+            npcX,
+          ) ||
+          !Number.isFinite(
+            npcZ,
+          )
+        ) {
+          return false;
+        }
+
+        const distance =
+          tileDistance(
+            playerX,
+            playerZ,
+            npcX,
+            npcZ,
+          );
+
+        return (
+          Number.isFinite(
+            distance,
+          ) &&
+          distance <=
+            maxDangerDistance
+        );
+      },
+    );
+
+  if (
+    !dangerousNpc
+  ) {
+    return null;
+  }
+
+  return normaliseDangerName(
+    dangerousNpc.name,
+  );
+}
+
+/* ================================================================
+ * DANGER ESCAPE
+ * ================================================================ */
+
+async function escapeDanger(
+  adapter:
+    RsSdkAdapter,
+
+  resource:
+    GatheringLocation,
+
+  danger:
+    string,
+): Promise<ScriptResult> {
+  const cleanDanger =
+    normaliseDangerName(
+      danger,
+    );
+
+  /*
+   * Never attempt a "danger escape" for placeholder values.
+   */
+  if (
+    !cleanDanger
+  ) {
+    return {
+      success:
+        true,
+
+      message:
+        "No actual danger present",
+
+      data: {
+        reason:
+          "no_danger",
+      },
+    };
+  }
+
+  const state =
+    adapter.getState();
+
+  const player =
+    state?.player as any;
+
+  const currentX =
+    Number(
+      player?.worldX ??
+        player?.x ??
+        resource.x,
+    );
+
+  const currentZ =
+    Number(
+      player?.worldZ ??
+        player?.z ??
+        resource.z,
+    );
+
+  /*
+   * Prefer running away from the resource anchor.
+   */
+  const dx =
+    currentX -
+    resource.x;
+
+  const dz =
+    currentZ -
+    resource.z;
+
+  const length =
+    Math.hypot(
+      dx,
+      dz,
+    );
+
+  let escapeX:
+    number;
+
+  let escapeZ:
+    number;
+
+  if (
+    length >
+    0
+  ) {
+    escapeX =
+      Math.round(
+        currentX +
+          (
+            dx /
+            length
+          ) *
+            10,
+      );
+
+    escapeZ =
+      Math.round(
+        currentZ +
+          (
+            dz /
+            length
+          ) *
+            10,
+      );
+  } else {
+    /*
+     * At the exact resource anchor, move south/east away from the
+     * resource rather than sitting on top of it.
+     */
+    escapeX =
+      Math.round(
+        currentX +
+          8,
+      );
+
+    escapeZ =
+      Math.round(
+        currentZ +
+          8,
+      );
+  }
+
+  console.log(
+    `[Gathering] Escaping ${cleanDanger} from (${currentX}, ${currentZ}) to (${escapeX}, ${escapeZ})...`,
+  );
+
+  const result =
+    await adapter.walkTo(
+      escapeX,
+      escapeZ,
+      2,
+    );
+
+  if (
+    !result.success
+  ) {
+    return {
+      success:
+        false,
+
+      message:
+        result.message,
+
+      data: {
+        reason:
+          "danger_escape_failed",
+
+        danger:
+          cleanDanger,
+
+        escapeX,
+
+        escapeZ,
+
+        ...(result.data ?? {}),
+      },
+    };
+  }
+
+  console.log(
+    `[Gathering] Escape completed at approximately (${escapeX}, ${escapeZ}).`,
+  );
+
+  return {
+    success:
+      true,
+
+    message:
+      `Escaped danger: ${cleanDanger}`,
+
+    data: {
+      reason:
+        "danger_escaped",
+
+      danger:
+        cleanDanger,
+
+      escapeX,
+
+      escapeZ,
+    },
+  };
 }
 
 /* ================================================================
  * HELPERS
  * ================================================================ */
+
+function normaliseDangerName(
+  value:
+    unknown,
+): string {
+  const text =
+    String(
+      value ?? "",
+    )
+      .trim();
+
+  if (
+    !text
+  ) {
+    return "";
+  }
+
+  const lower =
+    text.toLowerCase();
+
+  if (
+    lower === "none" ||
+    lower === "null" ||
+    lower === "undefined" ||
+    lower === "npc" ||
+    lower === "npcs" ||
+    lower === "no target" ||
+    lower === "no_target" ||
+    lower === "no target found" ||
+    lower === "unknown"
+  ) {
+    return "";
+  }
+
+  return text;
+}
 
 async function waitForTicksSafe(
   adapter:
@@ -1897,7 +2897,23 @@ async function waitForTicksSafe(
     await sdk.waitForTicks(
       ticks,
     );
+
+    return;
   }
+
+  await new Promise<void>(
+    (
+      resolve,
+    ) => {
+      setTimeout(
+        resolve,
+        Math.max(
+          100,
+          ticks * 600,
+        ),
+      );
+    },
+  );
 }
 
 function testRegex(
